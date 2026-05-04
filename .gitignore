@@ -1,0 +1,7 @@
+node_modules/
+server_key.json
+witness.db
+*.bak
+*.pre-*
+*.log
+.env
