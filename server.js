@@ -106,6 +106,71 @@ function nextSequence() {
   return serverState.sequence;
 }
 
+// === CANONICAL JSON AND SIGNED PAYLOADS ===
+// Wire-level signing pre-image. JSON with object keys at every level
+// sorted lexicographically, no insignificant whitespace, primitives
+// rendered by JSON.stringify. Array element order is preserved (only
+// object key order is canonicalized). Used as the byte string an
+// Ed25519 signature covers in Phase A and later wire formats.
+//
+// Pure functions. No module state. Callers pass the keys explicitly,
+// which makes these directly testable with throwaway keypairs.
+
+function canonicalize(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) {
+    return '[' + value.map(canonicalize).join(',') + ']';
+  }
+  if (typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    const parts = keys.map(k => JSON.stringify(k) + ':' + canonicalize(value[k]));
+    return '{' + parts.join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+// signPayload returns a new object with the signature appended. The
+// signature covers canonicalize(payload-without-signature). If the
+// caller's payload already has a signature field it is dropped before
+// signing; this lets a caller re-sign an updated payload without first
+// stripping it manually.
+function signPayload(payload, secretKeyBytes) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('signPayload: payload must be an object');
+  }
+  const { signature: _drop, ...rest } = payload;
+  const canonical = canonicalize(rest);
+  const msgBytes = naclUtil.decodeUTF8(canonical);
+  const sigBytes = nacl.sign.detached(msgBytes, secretKeyBytes);
+  return { ...rest, signature: Buffer.from(sigBytes).toString('hex') };
+}
+
+// verifyPayload returns true only if the signature field is present,
+// well-formed, and validates the canonical serialization of the
+// remaining fields under the supplied public key. Any malformed input
+// returns false rather than throwing, since this function processes
+// untrusted data from the network.
+function verifyPayload(payload, publicKeyBytes) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (typeof payload.signature !== 'string') return false;
+  if (!(publicKeyBytes instanceof Uint8Array) || publicKeyBytes.length !== 32) return false;
+  const { signature, ...rest } = payload;
+  let sigBytes;
+  try {
+    sigBytes = new Uint8Array(Buffer.from(signature, 'hex'));
+  } catch {
+    return false;
+  }
+  if (sigBytes.length !== 64) return false;
+  try {
+    const canonical = canonicalize(rest);
+    const msgBytes = naclUtil.decodeUTF8(canonical);
+    return nacl.sign.detached.verify(msgBytes, sigBytes, publicKeyBytes);
+  } catch {
+    return false;
+  }
+}
+
 // === DATABASE ===
 
 async function initDatabase() {
@@ -1471,7 +1536,13 @@ async function start() {
   });
 }
 
-start().catch(e => {
-  console.error('Fatal:', e);
-  process.exit(1);
-});
+if (require.main === module) {
+  start().catch(e => {
+    console.error('Fatal:', e);
+    process.exit(1);
+  });
+}
+
+// Pure helpers exported for test scripts. Module state (serverKeys,
+// serverState, db) is not exported and is undefined unless start() ran.
+module.exports = { canonicalize, signPayload, verifyPayload };
