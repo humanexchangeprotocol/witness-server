@@ -27,7 +27,12 @@ const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
 const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PEER_STALE_HOURS = 24;
-const SELF_URL = process.env.HCP_URL || null; // This server's public URL
+const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legacy)
+// Phase A signed-mode self-identification (witness-identity-protocol §6.1).
+// If unset, the witness still accepts signed announces but cannot originate
+// outbound signed announces until self-discovery (§5) lands in a later phase.
+const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
+const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const VERSION = '2.3.1';
 
@@ -169,6 +174,45 @@ function verifyPayload(payload, publicKeyBytes) {
   } catch {
     return false;
   }
+}
+
+// === SIGNED ANNOUNCE WIRE FORMAT (Phase A, slice 4) ===
+// Witness-identity-protocol §6.1. Dual-mode: this format coexists with
+// the legacy URL-keyed announce until Phase D removes legacy.
+//
+// Pure shape helpers. No DB access, no signature verification, no clock
+// or sequence checks. Receiver-side logic in handleSignedAnnounce wraps
+// these with verifyPayload, sequence freshness, and §7's 24-hour
+// relaxation for state-loss recovery.
+
+// isSignedAnnounce returns true if a request body has the structural
+// shape of the new signed-announce format. Distinguishes new format
+// from legacy by the fields the new format requires that legacy did
+// not carry (signature, endpoint, sequence, signed_at).
+function isSignedAnnounce(body) {
+  if (!body || typeof body !== 'object') return false;
+  if (typeof body.signature !== 'string') return false;
+  if (!body.endpoint || typeof body.endpoint !== 'object') return false;
+  if (!Number.isInteger(body.sequence)) return false;
+  if (!Number.isInteger(body.signed_at)) return false;
+  if (typeof body.pubkey !== 'string') return false;
+  return true;
+}
+
+// validateSignedAnnounceShape returns null on a structurally valid
+// payload, or a short error string identifying the first problem.
+// Does not check signature, sequence freshness, or clock skew (those
+// are receiver-side concerns layered on top of structural shape).
+function validateSignedAnnounceShape(body) {
+  if (!isSignedAnnounce(body)) return 'not signed-announce shape';
+  if (!/^[0-9a-f]{64}$/i.test(body.pubkey)) return 'bad pubkey';
+  const ep = body.endpoint;
+  if (typeof ep.host !== 'string' || ep.host.length === 0) return 'bad endpoint.host';
+  if (!Number.isInteger(ep.port) || ep.port < 1 || ep.port > 65535) return 'bad endpoint.port';
+  if (body.witnessed_count != null && !Number.isInteger(body.witnessed_count)) return 'bad witnessed_count';
+  if (body.peers != null && !Array.isArray(body.peers)) return 'bad peers';
+  if (body.version != null && typeof body.version !== 'string') return 'bad version';
+  return null;
 }
 
 // === DATABASE ===
@@ -343,6 +387,19 @@ async function initDatabase() {
   // Option B: encrypted snapshot + role for session privacy
   try { db.run('ALTER TABLE sessions ADD COLUMN encrypted_snapshot TEXT'); } catch(e) {}
   try { db.run('ALTER TABLE sessions ADD COLUMN role TEXT'); } catch(e) {}
+
+  // Witness identity protocol Phase A, slice 4: signed-format peer columns.
+  // Additive nullable migration. Existing url-keyed rows continue functioning
+  // through the dual-mode period. Signed-mode peers are deduplicated by
+  // pubkey at the application layer (see handleSignedAnnounce); url is
+  // synthesized from host:port to satisfy the existing PRIMARY KEY.
+  // last_signed_at is required by §7's 24-hour relaxation rule for
+  // recovery from server_state.json loss; receivers compare both sequence
+  // and signed_at to decide whether to accept a payload.
+  try { db.run('ALTER TABLE peers ADD COLUMN host TEXT'); } catch(e) {}
+  try { db.run('ALTER TABLE peers ADD COLUMN port INTEGER'); } catch(e) {}
+  try { db.run('ALTER TABLE peers ADD COLUMN last_sequence INTEGER'); } catch(e) {}
+  try { db.run('ALTER TABLE peers ADD COLUMN last_signed_at INTEGER'); } catch(e) {}
 
   // Load lifetime witness count
   const row = db.exec('SELECT COUNT(*) as c FROM witnessed_mints');
@@ -712,75 +769,201 @@ app.get('/relay/:handshake_id', (req, res) => {
 });
 
 // --- POST /announce ---
-// A server or phone tells us about a server
+// Dual-mode dispatch (witness-identity-protocol Phase A, slice 4).
+// Signed format (§6.1) is detected by isSignedAnnounce; legacy format
+// is the existing url-keyed payload. Both paths coexist until Phase D.
 app.post('/announce', (req, res) => {
   try {
-    const { url, pubkey, version: peerVersion, witnessed_count, peers: peerList } = req.body;
-
-    if (!url || !pubkey) {
-      return res.status(400).json({ error: 'Missing url or pubkey' });
+    if (isSignedAnnounce(req.body)) {
+      return handleSignedAnnounce(req, res);
     }
-
-    // Validate URL format
-    try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
-
-    // Don't accept announcements about ourselves
-    if (SELF_URL && url.replace(/\/+$/, '') === SELF_URL.replace(/\/+$/, '')) {
-      return res.json({ accepted: true, self: true });
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-    const cleanUrl = url.replace(/\/+$/, '');
-
-    // Check if we already know this peer
-    const existing = db.exec('SELECT pubkey FROM peers WHERE url = ?', [cleanUrl]);
-    const isNew = existing.length === 0 || existing[0].values.length === 0;
-
-    // Upsert the peer
-    db.run('DELETE FROM peers WHERE url = ?', [cleanUrl]);
-    db.run(
-      'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [cleanUrl, pubkey, peerVersion || '?', witnessed_count || 0, now, isNew ? now : now]
-    );
-
-    // Process any peers they told us about
-    if (Array.isArray(peerList)) {
-      for (const p of peerList.slice(0, 50)) { // Cap at 50 to prevent abuse
-        if (!p.url || !p.pubkey) continue;
-        const pUrl = p.url.replace(/\/+$/, '');
-        if (SELF_URL && pUrl === SELF_URL.replace(/\/+$/, '')) continue;
-        const pExists = db.exec('SELECT url FROM peers WHERE url = ?', [pUrl]);
-        if (pExists.length === 0 || pExists[0].values.length === 0) {
-          // New peer we didn't know about. Add with their reported heartbeat or now
-          db.run(
-            'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
-            [pUrl, p.pubkey, p.version || '?', p.witnessed_count || 0, p.last_seen || now, now]
-          );
-          console.log(`[gossip] Learned about new peer: ${pUrl}`);
-        }
-      }
-    }
-
-    saveDatabase();
-
-    if (isNew) {
-      console.log(`[gossip] New peer registered: ${cleanUrl}`);
-      // Announce ourselves back to the new peer (async, non-blocking)
-      if (SELF_URL) {
-        announceToServer(cleanUrl).catch(() => {});
-      }
-    } else {
-      console.log(`[gossip] Heartbeat from: ${cleanUrl}`);
-    }
-
-    // Return our peer list so the announcer learns about others
-    const ourPeers = getActivePeers();
-    res.json({ accepted: true, peers: ourPeers });
+    return handleLegacyAnnounce(req, res);
   } catch (e) {
     console.error('[announce] Error:', e.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+function handleLegacyAnnounce(req, res) {
+  const { url, pubkey, version: peerVersion, witnessed_count, peers: peerList } = req.body;
+
+  if (!url || !pubkey) {
+    return res.status(400).json({ error: 'Missing url or pubkey' });
+  }
+
+  // Validate URL format
+  try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+
+  // Don't accept announcements about ourselves
+  if (SELF_URL && url.replace(/\/+$/, '') === SELF_URL.replace(/\/+$/, '')) {
+    return res.json({ accepted: true, self: true });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const cleanUrl = url.replace(/\/+$/, '');
+
+  // Check if we already know this peer
+  const existing = db.exec('SELECT pubkey FROM peers WHERE url = ?', [cleanUrl]);
+  const isNew = existing.length === 0 || existing[0].values.length === 0;
+
+  // Upsert the peer
+  db.run('DELETE FROM peers WHERE url = ?', [cleanUrl]);
+  db.run(
+    'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [cleanUrl, pubkey, peerVersion || '?', witnessed_count || 0, now, isNew ? now : now]
+  );
+
+  // Process any peers they told us about
+  if (Array.isArray(peerList)) {
+    for (const p of peerList.slice(0, 50)) { // Cap at 50 to prevent abuse
+      if (!p.url || !p.pubkey) continue;
+      const pUrl = p.url.replace(/\/+$/, '');
+      if (SELF_URL && pUrl === SELF_URL.replace(/\/+$/, '')) continue;
+      const pExists = db.exec('SELECT url FROM peers WHERE url = ?', [pUrl]);
+      if (pExists.length === 0 || pExists[0].values.length === 0) {
+        // New peer we didn't know about. Add with their reported heartbeat or now
+        db.run(
+          'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [pUrl, p.pubkey, p.version || '?', p.witnessed_count || 0, p.last_seen || now, now]
+        );
+        console.log(`[gossip] Learned about new peer: ${pUrl}`);
+      }
+    }
+  }
+
+  saveDatabase();
+
+  if (isNew) {
+    console.log(`[gossip] New peer registered: ${cleanUrl}`);
+    // Announce ourselves back to the new peer (async, non-blocking)
+    if (SELF_URL) {
+      announceToServer(cleanUrl).catch(() => {});
+    }
+  } else {
+    console.log(`[gossip] Heartbeat from: ${cleanUrl}`);
+  }
+
+  // Return our peer list so the announcer learns about others
+  const ourPeers = getActivePeers();
+  res.json({ accepted: true, peers: ourPeers });
+}
+
+// handleSignedAnnounce implements witness-identity-protocol §6.1 plus
+// the §7 sequence and clock checks. The body has already been
+// structurally identified as signed by isSignedAnnounce in the route.
+function handleSignedAnnounce(req, res) {
+  const body = req.body;
+  const shapeError = validateSignedAnnounceShape(body);
+  if (shapeError) {
+    return res.status(400).json({ error: shapeError });
+  }
+
+  // Don't accept announcements claiming our own pubkey.
+  if (body.pubkey === serverKeys.publicKeyHex) {
+    return res.json({ accepted: true, self: true });
+  }
+
+  // Verify signature against the announcer's claimed pubkey.
+  let pubkeyBytes;
+  try {
+    pubkeyBytes = new Uint8Array(Buffer.from(body.pubkey, 'hex'));
+    if (pubkeyBytes.length !== 32) throw new Error('len');
+  } catch {
+    return res.status(400).json({ error: 'bad pubkey bytes' });
+  }
+  if (!verifyPayload(body, pubkeyBytes)) {
+    return res.status(401).json({ error: 'signature verification failed' });
+  }
+
+  // Clock skew guard (§7). Reject payloads more than 24 hours from our clock.
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - body.signed_at) > 24 * 60 * 60) {
+    return res.status(400).json({ error: 'signed_at out of range' });
+  }
+
+  // Sequence freshness check (§7) with 24-hour relaxation for state-loss
+  // recovery: a payload with sequence <= stored is accepted only if its
+  // signed_at is at least 24 hours newer than the last accepted signed_at
+  // for that pubkey.
+  const existing = db.exec(
+    'SELECT last_sequence, last_signed_at FROM peers WHERE pubkey = ?',
+    [body.pubkey]
+  );
+  if (existing.length > 0 && existing[0].values.length > 0) {
+    const prevSeq = existing[0].values[0][0];
+    const prevSignedAt = existing[0].values[0][1];
+    if (Number.isInteger(prevSeq) && body.sequence <= prevSeq) {
+      const relaxed =
+        Number.isInteger(prevSignedAt) &&
+        body.signed_at - prevSignedAt >= 24 * 60 * 60;
+      if (!relaxed) {
+        return res.status(409).json({ error: 'stale sequence' });
+      }
+    }
+  }
+
+  // Synthesize url for primary-key purposes; signed-mode rows are
+  // logically keyed by pubkey (DELETE WHERE pubkey = ? then INSERT).
+  const synthesized = `http://${body.endpoint.host}:${body.endpoint.port}`;
+  db.run('DELETE FROM peers WHERE pubkey = ?', [body.pubkey]);
+  db.run(
+    'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port, last_sequence, last_signed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      synthesized,
+      body.pubkey,
+      body.version || '?',
+      body.witnessed_count || 0,
+      now,
+      now,
+      body.endpoint.host,
+      body.endpoint.port,
+      body.sequence,
+      body.signed_at,
+    ]
+  );
+
+  // Process gossip-list entries. We accept new pubkeys for storage but
+  // never overwrite an existing pubkey's row from gossip; trust comes
+  // from a peer's own signed announce, never from a third party's claim.
+  if (Array.isArray(body.peers)) {
+    for (const p of body.peers.slice(0, 50)) {
+      if (!p || typeof p !== 'object') continue;
+      if (typeof p.pubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(p.pubkey)) continue;
+      if (p.pubkey === serverKeys.publicKeyHex) continue;
+      if (p.pubkey === body.pubkey) continue;
+      if (!p.endpoint || typeof p.endpoint !== 'object') continue;
+      const pHost = p.endpoint.host;
+      const pPort = p.endpoint.port;
+      if (typeof pHost !== 'string' || pHost.length === 0) continue;
+      if (!Number.isInteger(pPort) || pPort < 1 || pPort > 65535) continue;
+      const known = db.exec('SELECT pubkey FROM peers WHERE pubkey = ?', [p.pubkey]);
+      if (known.length === 0 || known[0].values.length === 0) {
+        const pUrl = `http://${pHost}:${pPort}`;
+        db.run(
+          'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [pUrl, p.pubkey, '?', 0, p.last_seen || now, now, pHost, pPort]
+        );
+        console.log(`[gossip] Learned about new peer (signed): ${p.pubkey.slice(0, 12)} at ${pHost}:${pPort}`);
+      }
+    }
+  }
+
+  saveDatabase();
+  console.log(`[gossip] Signed announce from ${body.pubkey.slice(0, 12)} seq=${body.sequence}`);
+
+  // Build signed response with observed_ip echo (§5).
+  const observedIpRaw = req.ip || (req.socket && req.socket.remoteAddress) || '';
+  const observedIp = observedIpRaw.replace(/^::ffff:/, '');
+  const response = {
+    accepted: true,
+    observed_ip: observedIp,
+    peers: getActivePeersSigned(),
+    server_pubkey: serverKeys.publicKeyHex,
+    signed_at: now,
+  };
+  const signed = signPayload(response, serverKeys.secretKey);
+  res.json(signed);
+}
 
 // --- GET /peers ---
 // Phone or server requests the list of healthy servers
@@ -803,6 +986,26 @@ function getActivePeers() {
     pubkey: row[1],
     version: row[2],
     witnessed_count: row[3],
+    last_seen: row[4],
+  }));
+}
+
+// getActivePeersSigned returns the peer list in the signed-format shape
+// (witness-identity-protocol §6.1 and §6.2). Only peers we have host/port
+// data for are returned; legacy url-only peers are not yet representable
+// in the signed wire format and will surface here once they upgrade and
+// re-announce in signed mode.
+function getActivePeersSigned() {
+  const cutoff = Math.floor(Date.now() / 1000) - (PEER_STALE_HOURS * 60 * 60);
+  const result = db.exec(
+    'SELECT pubkey, host, port, version, last_heartbeat FROM peers WHERE last_heartbeat >= ? AND host IS NOT NULL AND port IS NOT NULL',
+    [cutoff]
+  );
+  if (result.length === 0) return [];
+  return result[0].values.map(row => ({
+    pubkey: row[0],
+    endpoint: { host: row[1], port: row[2] },
+    version: row[3] || '?',
     last_seen: row[4],
   }));
 }
@@ -849,6 +1052,105 @@ async function announceToServer(targetUrl) {
     console.log(`[gossip] Could not reach ${cleanTarget}: ${e.message}`);
   }
   return false;
+}
+
+// announceSignedToServer originates a signed-format announce per
+// witness-identity-protocol §6.1, verifies the response signature, and
+// ingests the signed peer list. Requires SELF_HOST to be set (the
+// witness has a known public IP) and targetPubkey (the recipient's
+// known pubkey for response verification).
+//
+// Not yet wired into heartbeat. Available for cohort interop testing
+// and for future slices that drive outbound signed gossip. Wiring
+// signed-vs-legacy outbound mode selection into heartbeat is a
+// downstream concern; slice 4 is the inbound path and the staged
+// outbound helper, no automatic outbound behavior change.
+async function announceSignedToServer(targetUrl, targetPubkey) {
+  if (!SELF_HOST) {
+    console.log('[gossip] Cannot send signed announce: HCP_PUBLIC_IP unset');
+    return false;
+  }
+  if (typeof targetPubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(targetPubkey)) {
+    console.log('[gossip] Cannot send signed announce: bad targetPubkey');
+    return false;
+  }
+  const cleanTarget = targetUrl.replace(/\/+$/, '');
+  const now = Math.floor(Date.now() / 1000);
+  const sequence = nextSequence();
+  const peers = getActivePeersSigned().filter(p => p.pubkey !== targetPubkey);
+  const payload = {
+    pubkey: serverKeys.publicKeyHex,
+    endpoint: { host: SELF_HOST, port: SELF_PORT_PUBLIC },
+    version: VERSION,
+    witnessed_count: witnessedCount,
+    sequence,
+    signed_at: now,
+    peers,
+  };
+  const signed = signPayload(payload, serverKeys.secretKey);
+
+  try {
+    const resp = await fetch(cleanTarget + '/announce', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signed),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) {
+      console.log(`[gossip] Signed announce to ${cleanTarget}: HTTP ${resp.status}`);
+      return false;
+    }
+    const data = await resp.json();
+    if (data.self) return true; // peer recognized us as themselves; no-op
+
+    // Verify the response is signed by the pubkey we expect.
+    if (data.server_pubkey !== targetPubkey) {
+      console.log(`[gossip] Signed announce to ${cleanTarget}: server_pubkey mismatch`);
+      return false;
+    }
+    let targetPubkeyBytes;
+    try {
+      targetPubkeyBytes = new Uint8Array(Buffer.from(targetPubkey, 'hex'));
+      if (targetPubkeyBytes.length !== 32) throw new Error('len');
+    } catch {
+      return false;
+    }
+    if (!verifyPayload(data, targetPubkeyBytes)) {
+      console.log(`[gossip] Signed announce response from ${cleanTarget}: bad signature`);
+      return false;
+    }
+
+    // Ingest gossipped peers from the signed response.
+    if (Array.isArray(data.peers)) {
+      const tNow = Math.floor(Date.now() / 1000);
+      let inserted = false;
+      for (const p of data.peers) {
+        if (!p || typeof p !== 'object') continue;
+        if (typeof p.pubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(p.pubkey)) continue;
+        if (p.pubkey === serverKeys.publicKeyHex) continue;
+        if (!p.endpoint || typeof p.endpoint !== 'object') continue;
+        const pHost = p.endpoint.host;
+        const pPort = p.endpoint.port;
+        if (typeof pHost !== 'string' || pHost.length === 0) continue;
+        if (!Number.isInteger(pPort) || pPort < 1 || pPort > 65535) continue;
+        const known = db.exec('SELECT pubkey FROM peers WHERE pubkey = ?', [p.pubkey]);
+        if (known.length === 0 || known[0].values.length === 0) {
+          const pUrl = `http://${pHost}:${pPort}`;
+          db.run(
+            'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [pUrl, p.pubkey, p.version || '?', 0, p.last_seen || tNow, tNow, pHost, pPort]
+          );
+          console.log(`[gossip] Learned about peer from signed response ${cleanTarget}: ${p.pubkey.slice(0, 12)} at ${pHost}:${pPort}`);
+          inserted = true;
+        }
+      }
+      if (inserted) saveDatabase();
+    }
+    return true;
+  } catch (e) {
+    console.log(`[gossip] Could not reach ${cleanTarget} (signed): ${e.message}`);
+    return false;
+  }
 }
 
 async function heartbeat() {
@@ -1545,4 +1847,10 @@ if (require.main === module) {
 
 // Pure helpers exported for test scripts. Module state (serverKeys,
 // serverState, db) is not exported and is undefined unless start() ran.
-module.exports = { canonicalize, signPayload, verifyPayload };
+module.exports = {
+  canonicalize,
+  signPayload,
+  verifyPayload,
+  isSignedAnnounce,
+  validateSignedAnnounceShape,
+};
