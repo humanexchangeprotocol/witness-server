@@ -966,8 +966,26 @@ function handleSignedAnnounce(req, res) {
 }
 
 // --- GET /peers ---
-// Phone or server requests the list of healthy servers
+// Dual-mode (witness-identity-protocol Phase A, slice 5).
+// Plain /peers returns the legacy { peers, count } shape unchanged.
+// /peers?signed=1 returns the signed envelope per Section 6.2:
+// { server_pubkey, peers, as_of, signature } where each peer carries
+// pubkey + endpoint + version + last_seen.
+//
+// Mode is detected by an explicit query parameter. This is curl-
+// testable and gives Phase D a clean cutover when the legacy path
+// is removed.
 app.get('/peers', (req, res) => {
+  if (req.query.signed === '1') {
+    const now = Math.floor(Date.now() / 1000);
+    const envelope = {
+      server_pubkey: serverKeys.publicKeyHex,
+      peers: getActivePeersSigned(),
+      as_of: now,
+    };
+    const signed = signPayload(envelope, serverKeys.secretKey);
+    return res.json(signed);
+  }
   const peers = getActivePeers();
   res.json({ peers, count: peers.length });
 });
