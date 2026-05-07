@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const PORT = process.env.HCP_PORT || 3141;
 const DB_PATH = process.env.HCP_DB || path.join(__dirname, 'witness.db');
 const KEY_PATH = process.env.HCP_KEY || path.join(__dirname, 'server_key.json');
+const STATE_PATH = process.env.HCP_STATE || path.join(__dirname, 'server_state.json');
 const MINT_RETENTION_DAYS = 30;
 const RELAY_RETENTION_HOURS = 72;
 const PAIR_RETENTION_DAYS = 7;
@@ -32,6 +33,7 @@ const VERSION = '2.3.1';
 
 let db = null;
 let serverKeys = null;
+let serverState = null;
 let startTime = Date.now();
 let witnessedCount = 0;
 let pohPingCount = 0;
@@ -67,6 +69,41 @@ function sign(message) {
   const msgBytes = naclUtil.decodeUTF8(message);
   const signature = nacl.sign.detached(msgBytes, serverKeys.secretKey);
   return Buffer.from(signature).toString('hex');
+}
+
+// === SEQUENCE COUNTER ===
+// Monotonic 64-bit (JS-safe via Number, max 2^53-1) counter for replay
+// protection on signed wire payloads. Persisted to disk on every increment
+// so a sudden process exit cannot retroactively reissue a sequence number.
+//
+// State loss recovery (server_state.json deleted but server_key.json kept).
+// Counter restarts at 0. The protocol's 24-hour signed_at relaxation in
+// receivers (see witness-identity-protocol Section 7) is what lets the
+// witness rejoin the network after a one-day quiet window. No special
+// recovery logic on the sender side.
+
+function loadOrCreateState() {
+  if (fs.existsSync(STATE_PATH)) {
+    const data = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    const sequence = Number.isInteger(data.sequence) ? data.sequence : 0;
+    console.log('[state] Loaded sequence counter at', sequence);
+    return { sequence, updated: data.updated || null };
+  }
+  const fresh = { sequence: 0, updated: new Date().toISOString() };
+  fs.writeFileSync(STATE_PATH, JSON.stringify(fresh, null, 2));
+  console.log('[state] Initialized sequence counter at 0');
+  return fresh;
+}
+
+function persistState() {
+  serverState.updated = new Date().toISOString();
+  fs.writeFileSync(STATE_PATH, JSON.stringify(serverState, null, 2));
+}
+
+function nextSequence() {
+  serverState.sequence += 1;
+  persistState();
+  return serverState.sequence;
 }
 
 // === DATABASE ===
@@ -1372,6 +1409,7 @@ async function start() {
   console.log('');
 
   serverKeys = loadOrCreateKeys();
+  serverState = loadOrCreateState();
   await initDatabase();
 
   // Register self in peers table

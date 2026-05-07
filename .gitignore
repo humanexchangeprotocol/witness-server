@@ -1,5 +1,6 @@
 node_modules/
 server_key.json
+server_state.json
 witness.db
 *.bak
 *.pre-*
