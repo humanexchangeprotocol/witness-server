@@ -12,6 +12,8 @@ const {
   verifyPayload,
   isSignedAnnounce,
   validateSignedAnnounceShape,
+  isSignedSelfUpdate,
+  validateSignedSelfUpdateShape,
 } = require('./server.js');
 
 let passed = 0;
@@ -142,6 +144,95 @@ check('tampered payload (port change) fails verify',
   verifyPayload(tampered, kp.publicKey) === false);
 check('tampered payload still passes shape (signature is structurally present)',
   validateSignedAnnounceShape(tampered) === null);
+
+// === Slice 6: signed self-update shape ===
+
+function baseUpdatePayload(overrides = {}) {
+  return {
+    pubkey: 'a'.repeat(64),
+    endpoint: { host: '203.0.113.42', port: 3141 },
+    sequence: 1,
+    signed_at: Math.floor(Date.now() / 1000),
+    signature: 'b'.repeat(128),
+    ...overrides,
+  };
+}
+
+console.log('');
+console.log('isSignedSelfUpdate');
+
+check('rejects null',
+  isSignedSelfUpdate(null) === false);
+check('rejects empty object',
+  isSignedSelfUpdate({}) === false);
+check('rejects legacy announce shape',
+  isSignedSelfUpdate({ url: 'https://example.com', pubkey: 'a'.repeat(64) }) === false);
+check('rejects missing signature',
+  isSignedSelfUpdate(baseUpdatePayload({ signature: undefined })) === false);
+check('rejects missing endpoint',
+  isSignedSelfUpdate(baseUpdatePayload({ endpoint: undefined })) === false);
+check('rejects missing sequence',
+  isSignedSelfUpdate(baseUpdatePayload({ sequence: undefined })) === false);
+check('rejects float sequence',
+  isSignedSelfUpdate(baseUpdatePayload({ sequence: 1.5 })) === false);
+check('rejects missing signed_at',
+  isSignedSelfUpdate(baseUpdatePayload({ signed_at: undefined })) === false);
+check('rejects missing pubkey',
+  isSignedSelfUpdate(baseUpdatePayload({ pubkey: undefined })) === false);
+check('accepts well-formed self-update',
+  isSignedSelfUpdate(baseUpdatePayload()) === true);
+
+console.log('');
+console.log('validateSignedSelfUpdateShape');
+
+check('returns null for valid payload',
+  validateSignedSelfUpdateShape(baseUpdatePayload()) === null);
+check('rejects non-update-shape',
+  typeof validateSignedSelfUpdateShape({}) === 'string');
+check('rejects bad pubkey hex',
+  validateSignedSelfUpdateShape(baseUpdatePayload({ pubkey: 'abc' })) === 'bad pubkey');
+check('rejects empty endpoint.host',
+  validateSignedSelfUpdateShape(baseUpdatePayload({ endpoint: { host: '', port: 3141 } })) === 'bad endpoint.host');
+check('rejects port 0',
+  validateSignedSelfUpdateShape(baseUpdatePayload({ endpoint: { host: 'h', port: 0 } })) === 'bad endpoint.port');
+check('rejects port 65536',
+  validateSignedSelfUpdateShape(baseUpdatePayload({ endpoint: { host: 'h', port: 65536 } })) === 'bad endpoint.port');
+
+console.log('');
+console.log('round-trip: real keypair, sign self-update, verify');
+
+const updateUnsigned = {
+  pubkey: pubHex,
+  endpoint: { host: '198.51.100.7', port: 3141 },
+  sequence: 5,
+  signed_at: Math.floor(Date.now() / 1000),
+};
+const updateSigned = signPayload(updateUnsigned, kp.secretKey);
+
+check('signed update is detected as self-update',
+  isSignedSelfUpdate(updateSigned) === true);
+check('signed update passes shape validation',
+  validateSignedSelfUpdateShape(updateSigned) === null);
+check('signed update verifies under pubkey',
+  verifyPayload(updateSigned, kp.publicKey) === true);
+
+const updateTampered = { ...updateSigned, endpoint: { host: 'attacker', port: 1 } };
+check('tampered update fails verify',
+  verifyPayload(updateTampered, kp.publicKey) === false);
+
+// Self-update shape is intentionally a subset of announce; an announce
+// payload (which has extra fields) does NOT match isSignedSelfUpdate
+// only because of structural distinctness... actually it does match,
+// since update fields are all present in announce. The dispatch path
+// in server.js therefore checks isSignedAnnounce first via the
+// /announce route; the /update route is reached only by clients that
+// post to /update, which is itself the disambiguator.
+// We test a realistic case: the announce shape (with peers etc) sent
+// to the update endpoint matches the update-shape check structurally.
+// This is intentional; the route URL is the discriminator, not the
+// payload shape. The shape check just confirms required fields exist.
+check('a full announce payload structurally satisfies update shape too (URL discriminates)',
+  isSignedSelfUpdate(signed) === true);
 
 console.log('');
 console.log('summary  ' + passed + ' passed, ' + failed + ' failed');

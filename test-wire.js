@@ -193,6 +193,143 @@ async function main() {
   const legacyInSigned = d7.peers.find(p => p.pubkey === 'c'.repeat(64));
   check('signed /peers excludes legacy peers without endpoint', !legacyInSigned);
 
+  // === Slice 6: POST /update ===
+  console.log('');
+  console.log('Slice 6: /update on known peer');
+
+  // Use the peer we already announced (pubHex is in the table from earlier).
+  // The peer's last_sequence is 2 from the signed announce above.
+  const u1 = signPayload({
+    pubkey: pubHex,
+    endpoint: { host: '203.0.113.250', port: 3141 },
+    sequence: 10,
+    signed_at: Math.floor(Date.now() / 1000),
+  }, kp.secretKey);
+  const ru1 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(u1),
+  });
+  check('/update on known peer returns 200', ru1.status === 200, 'got ' + ru1.status);
+  const du1 = await ru1.json();
+  check('/update response.accepted is true', du1.accepted === true);
+
+  // Confirm the new endpoint is reflected in signed /peers.
+  const ru1peers = await fetch(`http://localhost:${PORT}/peers?signed=1`);
+  const du1peers = await ru1peers.json();
+  const updated = du1peers.peers.find(p => p.pubkey === pubHex);
+  check('updated peer endpoint.host reflects /update', updated && updated.endpoint.host === '203.0.113.250');
+  check('updated peer endpoint.port reflects /update', updated && updated.endpoint.port === 3141);
+  check('updated peer version preserved from prior announce', updated && updated.version === '2.4.0-test');
+
+  console.log('');
+  console.log('Slice 6: /update replay rejection');
+
+  const ru2 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(u1),
+  });
+  check('/update replay (same sequence) returns 409', ru2.status === 409, 'got ' + ru2.status);
+
+  // A sequence below the last_sequence (10) but above the announce's
+  // sequence (2) is still stale: /update and /announce share the
+  // per-peer sequence space.
+  const u3 = signPayload({
+    pubkey: pubHex,
+    endpoint: { host: '203.0.113.250', port: 3141 },
+    sequence: 5,
+    signed_at: Math.floor(Date.now() / 1000),
+  }, kp.secretKey);
+  const ru3 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(u3),
+  });
+  check('/update with sequence below stored returns 409', ru3.status === 409, 'got ' + ru3.status);
+
+  console.log('');
+  console.log('Slice 6: /update unknown pubkey');
+
+  // Brand-new pubkey, never announced. /update must reject with 404
+  // (design: /update is for known peers only).
+  const newKp = nacl.sign.keyPair();
+  const newPubHex = Buffer.from(newKp.publicKey).toString('hex');
+  const u4 = signPayload({
+    pubkey: newPubHex,
+    endpoint: { host: '203.0.113.99', port: 3141 },
+    sequence: 1,
+    signed_at: Math.floor(Date.now() / 1000),
+  }, newKp.secretKey);
+  const ru4 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(u4),
+  });
+  check('/update with unknown pubkey returns 404', ru4.status === 404, 'got ' + ru4.status);
+
+  console.log('');
+  console.log('Slice 6: /update tampered payload');
+
+  const u5 = signPayload({
+    pubkey: pubHex,
+    endpoint: { host: '203.0.113.250', port: 3141 },
+    sequence: 11,
+    signed_at: Math.floor(Date.now() / 1000),
+  }, kp.secretKey);
+  const tamperedU = { ...u5, endpoint: { host: 'attacker.example', port: 3141 } };
+  const ru5 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(tamperedU),
+  });
+  check('/update with tampered payload returns 401', ru5.status === 401, 'got ' + ru5.status);
+
+  console.log('');
+  console.log('Slice 6: /update bad shape');
+
+  const ru6 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pubkey: pubHex }),
+  });
+  check('/update with missing fields returns 400', ru6.status === 400, 'got ' + ru6.status);
+
+  const ru7 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(signPayload({
+      pubkey: pubHex,
+      endpoint: { host: '', port: 3141 },
+      sequence: 11,
+      signed_at: Math.floor(Date.now() / 1000),
+    }, kp.secretKey)),
+  });
+  check('/update with empty endpoint.host returns 400', ru7.status === 400, 'got ' + ru7.status);
+
+  console.log('');
+  console.log('Slice 6: /update with own pubkey (self short-circuit)');
+
+  // The server's own pubkey signing isn't possible from here (we don't
+  // have its secret key) so we just send a structurally valid payload
+  // claiming to be from the server itself. Signature won't verify, but
+  // self-pubkey check happens BEFORE signature verification, so the
+  // self short-circuit returns 200 with self: true.
+  const u8 = signPayload({
+    pubkey: serverPubkey,
+    endpoint: { host: '203.0.113.1', port: 3141 },
+    sequence: 1,
+    signed_at: Math.floor(Date.now() / 1000),
+  }, kp.secretKey); // signed with wrong key, but server short-circuits before checking
+  const ru8 = await fetch(`http://localhost:${PORT}/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(u8),
+  });
+  check('/update from own pubkey returns 200 with self:true', ru8.status === 200, 'got ' + ru8.status);
+  const du8 = await ru8.json();
+  check('/update self short-circuit response has self: true', du8.self === true);
+
   // === Done ===
   console.log('');
   console.log('summary  ' + passed + ' passed, ' + failed + ' failed');

@@ -215,6 +215,33 @@ function validateSignedAnnounceShape(body) {
   return null;
 }
 
+// === SIGNED SELF-UPDATE WIRE FORMAT (Phase A, slice 6) ===
+// Witness-identity-protocol §6.3. New POST /update endpoint. Smaller
+// payload than /announce; used when a witness's observed public IP
+// changes and it wants to broadcast the new endpoint without waiting
+// for the heartbeat cycle.
+//
+// Pure shape helpers, mirroring the announce pair above.
+
+function isSignedSelfUpdate(body) {
+  if (!body || typeof body !== 'object') return false;
+  if (typeof body.signature !== 'string') return false;
+  if (typeof body.pubkey !== 'string') return false;
+  if (!body.endpoint || typeof body.endpoint !== 'object') return false;
+  if (!Number.isInteger(body.sequence)) return false;
+  if (!Number.isInteger(body.signed_at)) return false;
+  return true;
+}
+
+function validateSignedSelfUpdateShape(body) {
+  if (!isSignedSelfUpdate(body)) return 'not signed-update shape';
+  if (!/^[0-9a-f]{64}$/i.test(body.pubkey)) return 'bad pubkey';
+  const ep = body.endpoint;
+  if (typeof ep.host !== 'string' || ep.host.length === 0) return 'bad endpoint.host';
+  if (!Number.isInteger(ep.port) || ep.port < 1 || ep.port > 65535) return 'bad endpoint.port';
+  return null;
+}
+
 // === DATABASE ===
 
 async function initDatabase() {
@@ -988,6 +1015,104 @@ app.get('/peers', (req, res) => {
   }
   const peers = getActivePeers();
   res.json({ peers, count: peers.length });
+});
+
+// --- POST /update ---
+// Self-update broadcast (witness-identity-protocol §6.3). A known
+// peer announcing a changed endpoint without a full /announce cycle.
+//
+// Receiver checks (same as signed /announce):
+// - Structural shape.
+// - Signature verification against the announcer's claimed pubkey.
+// - Clock skew guard (24h window).
+// - Sequence freshness with 24h signed_at relaxation for state-loss
+//   recovery.
+//
+// Distinct from /announce in three ways: smaller payload (no peers
+// gossip, no witnessed_count, no version), updates only the endpoint
+// fields, and rejects unknown pubkeys with 404 (a brand-new peer
+// must do a full /announce first; /update is for IP changes on
+// peers we already know).
+app.post('/update', (req, res) => {
+  try {
+    const body = req.body;
+    if (!isSignedSelfUpdate(body)) {
+      return res.status(400).json({ error: 'not signed-update shape' });
+    }
+    const shapeError = validateSignedSelfUpdateShape(body);
+    if (shapeError) {
+      return res.status(400).json({ error: shapeError });
+    }
+
+    if (body.pubkey === serverKeys.publicKeyHex) {
+      return res.json({ accepted: true, self: true });
+    }
+
+    let pubkeyBytes;
+    try {
+      pubkeyBytes = new Uint8Array(Buffer.from(body.pubkey, 'hex'));
+      if (pubkeyBytes.length !== 32) throw new Error('len');
+    } catch {
+      return res.status(400).json({ error: 'bad pubkey bytes' });
+    }
+    if (!verifyPayload(body, pubkeyBytes)) {
+      return res.status(401).json({ error: 'signature verification failed' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - body.signed_at) > 24 * 60 * 60) {
+      return res.status(400).json({ error: 'signed_at out of range' });
+    }
+
+    // Pubkey must already be in the peer table; /update is for IP
+    // changes on known peers, not for first introductions.
+    const existing = db.exec(
+      'SELECT last_sequence, last_signed_at, version, witnessed_count FROM peers WHERE pubkey = ?',
+      [body.pubkey]
+    );
+    if (existing.length === 0 || existing[0].values.length === 0) {
+      return res.status(404).json({ error: 'unknown pubkey, send /announce first' });
+    }
+
+    const prevSeq = existing[0].values[0][0];
+    const prevSignedAt = existing[0].values[0][1];
+    const prevVersion = existing[0].values[0][2] || '?';
+    const prevWitnessed = existing[0].values[0][3] || 0;
+
+    if (Number.isInteger(prevSeq) && body.sequence <= prevSeq) {
+      const relaxed =
+        Number.isInteger(prevSignedAt) &&
+        body.signed_at - prevSignedAt >= 24 * 60 * 60;
+      if (!relaxed) {
+        return res.status(409).json({ error: 'stale sequence' });
+      }
+    }
+
+    const synthesized = `http://${body.endpoint.host}:${body.endpoint.port}`;
+    db.run('DELETE FROM peers WHERE pubkey = ?', [body.pubkey]);
+    db.run(
+      'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port, last_sequence, last_signed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        synthesized,
+        body.pubkey,
+        prevVersion,
+        prevWitnessed,
+        now,
+        now,
+        body.endpoint.host,
+        body.endpoint.port,
+        body.sequence,
+        body.signed_at,
+      ]
+    );
+    saveDatabase();
+    console.log(`[gossip] Self-update from ${body.pubkey.slice(0, 12)} -> ${body.endpoint.host}:${body.endpoint.port} seq=${body.sequence}`);
+
+    res.json({ accepted: true });
+  } catch (e) {
+    console.error('[update] Error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // === GOSSIP FUNCTIONS ===
@@ -1846,6 +1971,7 @@ async function start() {
     console.log(`         POST /session/:code/confirm confirm proposal`);
     console.log(`         POST /announce    register a server`);
     console.log(`         GET  /peers       list active servers`);
+    console.log(`         POST /update      signed self-update broadcast`);
     console.log(`         GET  /status      health check`);
     console.log('');
 
@@ -1871,4 +1997,6 @@ module.exports = {
   verifyPayload,
   isSignedAnnounce,
   validateSignedAnnounceShape,
+  isSignedSelfUpdate,
+  validateSignedSelfUpdateShape,
 };
