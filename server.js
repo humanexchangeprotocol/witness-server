@@ -1,8 +1,7 @@
 /**
- * Human Credit Protocol — Witness Server
- * Phase 2 Implementation
- * 
- * Three jobs: witness attestation, settlement relay, network presence.
+ * Human Exchange Protocol Witness Server
+ *
+ * Three jobs. Witness attestation, settlement relay, network presence.
  * Two tables. One signing key. Nothing more.
  */
 
@@ -22,14 +21,14 @@ const KEY_PATH = process.env.HCP_KEY || path.join(__dirname, 'server_key.json');
 const MINT_RETENTION_DAYS = 30;
 const RELAY_RETENTION_HOURS = 72;
 const PAIR_RETENTION_DAYS = 7;
-const SESSION_RETENTION_HOURS = 24; // Sessions are ephemeral — 24 hour max
+const SESSION_RETENTION_HOURS = 24; // Sessions are ephemeral, 24 hour max
 const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
 const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PEER_STALE_HOURS = 24;
 const SELF_URL = process.env.HCP_URL || null; // This server's public URL
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.3.0';
+const VERSION = '2.3.1';
 
 let db = null;
 let serverKeys = null;
@@ -138,7 +137,7 @@ async function initDatabase() {
     )
   `);
 
-  // Session tables — ephemeral pipe for thread sharing + single-sided proposals
+  // Session tables. Ephemeral pipe for thread sharing + single-sided proposals
   db.run(`
     CREATE TABLE IF NOT EXISTS sessions (
       my_code TEXT PRIMARY KEY,
@@ -289,7 +288,7 @@ function runCleanup() {
   const pairCutoff = now - (PAIR_RETENTION_DAYS * 24 * 60 * 60);
   db.run('DELETE FROM pair_halves WHERE created_at < ?', [pairCutoff]);
 
-  // Clean up expired sessions (ephemeral — 24 hours max)
+  // Clean up expired sessions (ephemeral, 24 hours max)
   const sessionCutoff = now - (SESSION_RETENTION_HOURS * 60 * 60);
   const expiredSessions = db.exec('SELECT my_code FROM sessions WHERE created_at < ?', [sessionCutoff]);
   const sessionCount = expiredSessions.length > 0 ? expiredSessions[0].values.length : 0;
@@ -374,7 +373,7 @@ app.post('/witness', (req, res) => {
     // Check if already witnessed
     const existing = db.exec('SELECT server_ts, server_sig FROM witnessed_mints WHERE mint_hash = ?', [mint_hash]);
     if (existing.length > 0 && existing[0].values.length > 0) {
-      // Idempotent — return existing attestation
+      // Idempotent. Return existing attestation
       const row = existing[0].values[0];
       return res.json({
         mint_hash,
@@ -562,7 +561,7 @@ app.put('/relay/:handshake_id', (req, res) => {
 
     const now = Math.floor(Date.now() / 1000);
 
-    // Upsert — overwrite if exists (handles retries)
+    // Upsert. Overwrite if exists (handles retries)
     db.run('DELETE FROM settlement_relay WHERE handshake_id = ?', [handshake_id]);
     db.run(
       'INSERT INTO settlement_relay (handshake_id, encrypted_payload, created_at) VALUES (?, ?, ?)',
@@ -597,7 +596,7 @@ app.get('/relay/:handshake_id', (req, res) => {
 
     const payload = result[0].values[0][0];
 
-    // Fire and forget — delete after retrieval
+    // Fire and forget. Delete after retrieval
     db.run('DELETE FROM settlement_relay WHERE handshake_id = ?', [handshake_id]);
     saveDatabase();
 
@@ -650,7 +649,7 @@ app.post('/announce', (req, res) => {
         if (SELF_URL && pUrl === SELF_URL.replace(/\/+$/, '')) continue;
         const pExists = db.exec('SELECT url FROM peers WHERE url = ?', [pUrl]);
         if (pExists.length === 0 || pExists[0].values.length === 0) {
-          // New peer we didn't know about — add with their reported heartbeat or now
+          // New peer we didn't know about. Add with their reported heartbeat or now
           db.run(
             'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
             [pUrl, p.pubkey, p.version || '?', p.witnessed_count || 0, p.last_seen || now, now]
@@ -818,7 +817,7 @@ app.post('/pair', (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Validate codes — 6 alphanumeric characters
+    // Validate codes. 6 alphanumeric characters
     if (!/^[A-Z]{6}$/.test(my_code) || !/^[A-Z]{6}$/.test(their_code)) {
       return res.status(400).json({ error: 'Invalid code format' });
     }
@@ -857,7 +856,7 @@ app.post('/pair', (req, res) => {
           counterparty_device_hash: cpDeviceHash,
         });
       }
-      // Already stored but not resolved — update and re-check
+      // Already stored but not resolved. Update and re-check
       return res.json({ stored: true, resolved: false, status: 'waiting' });
     }
 
@@ -895,7 +894,7 @@ app.post('/pair', (req, res) => {
         (direction === 'received' && otherDirection === 'provided');
 
       if (valuesMatch && directionsComplement) {
-        // Match! Resolve both halves — store each other's descriptions
+        // Match. Resolve both halves and store each other's descriptions
         db.run('UPDATE pair_halves SET resolved = 1, resolve_status = ?, counterparty_fp = ?, counterparty_key = ?, counterparty_desc = ? WHERE my_code = ?',
           ['matched', otherFp, otherKey, otherDesc, my_code]);
         db.run('UPDATE pair_halves SET resolved = 1, resolve_status = ?, counterparty_fp = ?, counterparty_key = ?, counterparty_desc = ? WHERE my_code = ?',
@@ -927,7 +926,7 @@ app.post('/pair', (req, res) => {
       }
     }
 
-    // No match yet — other half hasn't arrived
+    // No match yet. Other half hasn't arrived
     saveDatabase();
     res.json({ stored: true, resolved: false, status: 'waiting' });
   } catch (e) {
@@ -1210,7 +1209,7 @@ app.post('/session/:code/propose', (req, res) => {
 
     const partner = db.exec('SELECT my_code FROM sessions WHERE my_code = ? AND their_code = ?', [theirCode, code]);
     if (partner.length === 0 || partner[0].values.length === 0) {
-      return res.status(409).json({ error: 'Session not yet connected — partner has not joined' });
+      return res.status(409).json({ error: 'Session not yet connected. Partner has not joined' });
     }
 
     const sKey = sessionKey(code, theirCode);
@@ -1367,7 +1366,7 @@ app.use((req, res) => {
 async function start() {
   console.log('');
   console.log('  ╔══════════════════════════════════════╗');
-  console.log('  ║   Human Credit Protocol              ║');
+  console.log('  ║   Human Exchange Protocol            ║');
   console.log('  ║   Witness Server v' + VERSION + '              ║');
   console.log('  ╚══════════════════════════════════════╝');
   console.log('');
@@ -1387,7 +1386,7 @@ async function start() {
     saveDatabase();
     console.log(`[gossip] Self-registered as: ${selfClean}`);
   } else {
-    console.log('[gossip] No HCP_URL set — server will accept announces but cannot gossip');
+    console.log('[gossip] No HCP_URL set, server will accept announces but cannot gossip');
   }
 
   // Add seed peers
@@ -1411,20 +1410,20 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`[server] Listening on port ${PORT}`);
     console.log(`[server] Endpoints:`);
-    console.log(`         POST /witness     — submit mint for attestation`);
-    console.log(`         POST /ping        — proof-of-human heartbeat attestation`);
-    console.log(`         PUT  /relay/:id   — deposit settlement`);
-    console.log(`         GET  /relay/:id   — retrieve settlement`);
-    console.log(`         POST /pair        — submit pairing code half`);
-    console.log(`         GET  /pair/check/:code — check pair resolution`);
-    console.log(`         POST /session/join     — join a session`);
-    console.log(`         GET  /session/:code    — poll session state`);
-    console.log(`         POST /session/:code/thread  — push thread snapshot`);
-    console.log(`         POST /session/:code/propose — submit proposal`);
-    console.log(`         POST /session/:code/confirm — confirm proposal`);
-    console.log(`         POST /announce    — register a server`);
-    console.log(`         GET  /peers       — list active servers`);
-    console.log(`         GET  /status      — health check`);
+    console.log(`         POST /witness     submit mint for attestation`);
+    console.log(`         POST /ping        proof-of-human heartbeat attestation`);
+    console.log(`         PUT  /relay/:id   deposit settlement`);
+    console.log(`         GET  /relay/:id   retrieve settlement`);
+    console.log(`         POST /pair        submit pairing code half`);
+    console.log(`         GET  /pair/check/:code check pair resolution`);
+    console.log(`         POST /session/join     join a session`);
+    console.log(`         GET  /session/:code    poll session state`);
+    console.log(`         POST /session/:code/thread  push thread snapshot`);
+    console.log(`         POST /session/:code/propose submit proposal`);
+    console.log(`         POST /session/:code/confirm confirm proposal`);
+    console.log(`         POST /announce    register a server`);
+    console.log(`         GET  /peers       list active servers`);
+    console.log(`         GET  /status      health check`);
     console.log('');
 
     // Initial heartbeat after startup (give server 2 seconds to settle)
