@@ -461,6 +461,144 @@ async function main() {
   procB.kill();
   await new Promise(r => setTimeout(r, 200));
 
+  // === Slice 8: heartbeat mode dispatch (witness-identity-protocol §6.1) ===
+  // Spawn a third server A2 with HCP_PUBLIC_IP set so it can originate
+  // signed announces, and a fourth server B2 with a known keypair.
+  // Bootstrap A2's peer table with B2 by manually announcing as B2.
+  // Then trigger A2's heartbeat (via the HCP_DEBUG endpoint) and
+  // verify B2 received a signed announce for A2.
+  console.log('');
+  console.log('Slice 8: heartbeat dispatches signed when peer has signed-mode columns');
+
+  const PORT_A2 = 4448;
+  const PORT_B2 = 4449;
+  const TMP_A2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hep-wire-a2-'));
+  const TMP_B2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hep-wire-b2-'));
+
+  // Pre-place B2's keypair so the test client can sign as B2.
+  const kpB2 = nacl.sign.keyPair();
+  const pubB2 = Buffer.from(kpB2.publicKey).toString('hex');
+  fs.writeFileSync(path.join(TMP_B2, 'server_key.json'), JSON.stringify({
+    publicKey: Buffer.from(kpB2.publicKey).toString('base64'),
+    secretKey: Buffer.from(kpB2.secretKey).toString('base64'),
+    publicKeyHex: pubB2,
+    created: new Date().toISOString(),
+  }, null, 2));
+
+  // A2: configured for signed outbound (HCP_PUBLIC_IP), HCP_DEBUG so
+  // we can trigger heartbeat on demand. We don't set HCP_URL here
+  // because A2 only needs signed-mode capability for this test.
+  let a2Booted = false;
+  let a2Pubkey = null;
+  const procA2 = spawn('node', ['server.js'], {
+    env: {
+      ...process.env,
+      HCP_PORT: String(PORT_A2),
+      HCP_DB: path.join(TMP_A2, 'witness.db'),
+      HCP_KEY: path.join(TMP_A2, 'server_key.json'),
+      HCP_STATE: path.join(TMP_A2, 'server_state.json'),
+      HCP_PUBLIC_IP: '127.0.0.1',
+      HCP_PUBLIC_PORT: String(PORT_A2),
+      HCP_DEBUG: '1',
+      HCP_HEARTBEAT_INTERVAL_MS: '3600000', // 1 hour, effectively disabled; we trigger manually
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  procA2.stdout.on('data', d => {
+    const s = d.toString();
+    const m = s.match(/Public key:\s+([0-9a-f]{64})/);
+    if (m) a2Pubkey = m[1];
+    if (s.includes('Listening on port')) a2Booted = true;
+  });
+
+  let b2Booted = false;
+  const procB2 = spawn('node', ['server.js'], {
+    env: {
+      ...process.env,
+      HCP_PORT: String(PORT_B2),
+      HCP_DB: path.join(TMP_B2, 'witness.db'),
+      HCP_KEY: path.join(TMP_B2, 'server_key.json'),
+      HCP_STATE: path.join(TMP_B2, 'server_state.json'),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  procB2.stdout.on('data', d => {
+    if (d.toString().includes('Listening on port')) b2Booted = true;
+  });
+
+  await waitFor(() => a2Booted && b2Booted && a2Pubkey, 5000);
+  if (!a2Booted || !b2Booted || !a2Pubkey) {
+    console.log('FAIL: A2/B2 did not boot within 5s');
+    proc.kill(); procA2.kill(); procB2.kill();
+    process.exit(1);
+  }
+
+  // Bootstrap: announce as B2 to A2 so A2 has B2 in its peer table
+  // with signed-mode columns populated. Reachability probe will
+  // succeed (B2 actually serves /status with pubB2).
+  const bootstrapAnnounce = signPayload({
+    pubkey: pubB2,
+    endpoint: { host: 'localhost', port: PORT_B2 },
+    version: '2.4.0-test-B2',
+    witnessed_count: 0,
+    sequence: 1,
+    signed_at: Math.floor(Date.now() / 1000),
+    peers: [],
+  }, kpB2.secretKey);
+  const rBoot = await fetch(`http://localhost:${PORT_A2}/announce`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bootstrapAnnounce),
+  });
+  check('A2 accepts bootstrap announce from B2', rBoot.status === 200, 'got ' + rBoot.status);
+
+  // Wait for A2's reachability probe to B2 to complete (B2 is on
+  // loopback so it should be quick).
+  const a2KnowsB2 = await waitFor(async () => {
+    const r = await fetch(`http://localhost:${PORT_A2}/peers?signed=1`);
+    const d = await r.json();
+    return d.peers.some(p => p.pubkey === pubB2);
+  }, 5000);
+  check('A2 has B2 as a reachable signed peer (bootstrap done)', a2KnowsB2);
+
+  // Sanity check: B2 does NOT yet know A2 (A2 has not announced to
+  // anyone yet; heartbeat hasn't fired).
+  const b2PeersBefore = await fetch(`http://localhost:${PORT_B2}/peers?signed=1`).then(r => r.json());
+  const b2HasA2Before = b2PeersBefore.peers.some(p => p.pubkey === a2Pubkey);
+  check('B2 does not yet know A2 (pre-heartbeat)', !b2HasA2Before);
+
+  // Trigger A2's heartbeat. selectAnnounceMode will return 'signed'
+  // for B2 (host/port/pubkey populated), SELF_HOST is set on A2, so
+  // A2 sends a signed announce to B2.
+  const rHb = await fetch(`http://localhost:${PORT_A2}/debug/heartbeat`, {
+    method: 'POST',
+  });
+  check('A2 /debug/heartbeat returns 200', rHb.status === 200, 'got ' + rHb.status);
+  const dHb = await rHb.json();
+  check('A2 /debug/heartbeat reports ok', dHb.ok === true);
+
+  // After the heartbeat, B2 should have received A2's signed announce.
+  // B2's reachability probe back to A2 (at 127.0.0.1:PORT_A2) should
+  // also succeed since A2's /status returns A2's pubkey. Poll B2's
+  // signed peers until A2 appears.
+  const b2KnowsA2 = await waitFor(async () => {
+    const r = await fetch(`http://localhost:${PORT_B2}/peers?signed=1`);
+    const d = await r.json();
+    return d.peers.some(p => p.pubkey === a2Pubkey);
+  }, 8000);
+  check('B2 received A2 as a reachable signed peer (heartbeat dispatched correctly)', b2KnowsA2);
+
+  // Verify the entry shape on B2's view of A2.
+  const peersB2 = await fetch(`http://localhost:${PORT_B2}/peers?signed=1`).then(r => r.json());
+  const a2OnB2 = peersB2.peers.find(p => p.pubkey === a2Pubkey);
+  check('B2\'s view of A2 has correct host', a2OnB2 && a2OnB2.endpoint.host === '127.0.0.1');
+  check('B2\'s view of A2 has correct port', a2OnB2 && a2OnB2.endpoint.port === PORT_A2);
+
+  // Cleanup A2/B2.
+  procA2.kill();
+  procB2.kill();
+  await new Promise(r => setTimeout(r, 200));
+
   // === Done ===
   console.log('');
   console.log('summary  ' + passed + ' passed, ' + failed + ' failed');

@@ -25,7 +25,7 @@ const PAIR_RETENTION_DAYS = 7;
 const SESSION_RETENTION_HOURS = 24; // Sessions are ephemeral, 24 hour max
 const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
-const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HCP_HEARTBEAT_INTERVAL_MS, 10) || (15 * 60 * 1000); // default 15 minutes; env override in seconds*1000 for test/operator tuning
 const PEER_STALE_HOURS = 24;
 const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legacy)
 // Phase A signed-mode self-identification (witness-identity-protocol §6.1).
@@ -240,6 +240,27 @@ function validateSignedSelfUpdateShape(body) {
   if (typeof ep.host !== 'string' || ep.host.length === 0) return 'bad endpoint.host';
   if (!Number.isInteger(ep.port) || ep.port < 1 || ep.port > 65535) return 'bad endpoint.port';
   return null;
+}
+
+// === HEARTBEAT MODE DISPATCH (Phase A, slice 8) ===
+// Pure function that decides whether we should announce TO a given
+// peer using the signed wire format (§6.1) or the legacy URL-keyed
+// format. Returns 'signed' if the peer's row has populated host AND
+// port columns (which means the peer has previously spoken signed
+// to us, so we know they understand the format). Returns 'legacy'
+// otherwise.
+//
+// The caller (heartbeat) further gates 'signed' on whether we
+// ourselves can originate signed announces (SELF_HOST set; without
+// it announceSignedToServer cannot construct the endpoint to claim
+// in the payload). Mode-selection here reflects peer-side capability
+// only; sender-side capability is the caller's concern.
+function selectAnnounceMode(peerRow) {
+  if (!peerRow || typeof peerRow !== 'object') return 'legacy';
+  if (typeof peerRow.host !== 'string' || peerRow.host.length === 0) return 'legacy';
+  if (!Number.isInteger(peerRow.port) || peerRow.port < 1 || peerRow.port > 65535) return 'legacy';
+  if (typeof peerRow.pubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(peerRow.pubkey)) return 'legacy';
+  return 'signed';
 }
 
 // === REACHABILITY (witness-identity-protocol §9, slice 7) ===
@@ -1097,6 +1118,23 @@ app.get('/peers', (req, res) => {
   res.json({ peers, count: peers.length });
 });
 
+// --- POST /debug/heartbeat ---
+// Test affordance only, gated on HCP_DEBUG=1. Triggers heartbeat()
+// synchronously and returns when it completes. Lets the wire test
+// exercise the per-peer mode dispatch without waiting on the
+// interval timer. The endpoint is not registered at all unless
+// HCP_DEBUG is set, so production deploys cannot reach it.
+if (process.env.HCP_DEBUG === '1') {
+  app.post('/debug/heartbeat', async (req, res) => {
+    try {
+      await heartbeat();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+}
+
 // --- POST /update ---
 // Self-update broadcast (witness-identity-protocol §6.3). A known
 // peer announcing a changed endpoint without a full /announce cycle.
@@ -1383,28 +1421,66 @@ async function announceSignedToServer(targetUrl, targetPubkey) {
 }
 
 async function heartbeat() {
-  if (!SELF_URL) return;
+  // Run heartbeat if either legacy (SELF_URL) or signed (SELF_HOST)
+  // self-identification is configured. Without either we have nothing
+  // to announce ourselves AS.
+  if (!SELF_URL && !SELF_HOST) return;
   const now = Math.floor(Date.now() / 1000);
 
-  // Update our own heartbeat
-  const selfClean = SELF_URL.replace(/\/+$/, '');
-  db.run('DELETE FROM peers WHERE url = ?', [selfClean]);
-  db.run(
-    'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
-    [selfClean, serverKeys.publicKeyHex, VERSION, witnessedCount, now, now]
+  // Self-row update (legacy schema). Only meaningful when SELF_URL is
+  // set, since the row is keyed by url. The signed-mode equivalent is
+  // implicit: we don't probe ourselves and our own /peers list does
+  // not need to contain us.
+  let selfClean = null;
+  if (SELF_URL) {
+    selfClean = SELF_URL.replace(/\/+$/, '');
+    db.run('DELETE FROM peers WHERE url = ?', [selfClean]);
+    db.run(
+      'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [selfClean, serverKeys.publicKeyHex, VERSION, witnessedCount, now, now]
+    );
+    saveDatabase();
+  }
+
+  // Read peers with all fields needed for mode dispatch. Filter self
+  // by pubkey (covers both legacy and signed-mode self rows).
+  const peerCutoff = now - (PEER_STALE_HOURS * 60 * 60);
+  const result = db.exec(
+    'SELECT url, pubkey, host, port FROM peers WHERE last_heartbeat >= ? AND pubkey != ?',
+    [peerCutoff, serverKeys.publicKeyHex]
   );
-  saveDatabase();
+  const peers = result.length === 0 ? [] : result[0].values.map(row => ({
+    url: row[0],
+    pubkey: row[1],
+    host: row[2],
+    port: row[3],
+  }));
 
-  // Announce to all known peers
-  const peers = getActivePeers().filter(p => p.url !== selfClean);
-  if (peers.length === 0 && SEED_PEERS.length === 0) return;
+  // Seed peers (legacy URLs from HCP_SEEDS env). We have no pubkey
+  // for these until they reply, so dispatch is always legacy.
+  const seedTargets = SEED_PEERS.filter(s =>
+    s !== selfClean && !peers.some(p => p.url === s)
+  );
 
-  const targets = [...new Set([...peers.map(p => p.url), ...SEED_PEERS])];
-  console.log(`[gossip] Heartbeating to ${targets.length} peer(s)`);
+  if (peers.length === 0 && seedTargets.length === 0) return;
 
-  for (const target of targets) {
+  let signedCount = 0;
+  let legacyCount = 0;
+  for (const peer of peers) {
+    const mode = selectAnnounceMode(peer);
+    if (mode === 'signed' && SELF_HOST) {
+      signedCount += 1;
+      await announceSignedToServer(`http://${peer.host}:${peer.port}`, peer.pubkey);
+    } else {
+      legacyCount += 1;
+      await announceToServer(peer.url);
+    }
+  }
+  for (const target of seedTargets) {
+    legacyCount += 1;
     await announceToServer(target);
   }
+  console.log(`[gossip] Heartbeat: ${signedCount} signed + ${legacyCount} legacy`);
 }
 
 // --- GET /status (updated with peer count) ---
@@ -2035,10 +2111,16 @@ async function start() {
   // Periodic database save
   setInterval(saveDatabase, DB_SAVE_INTERVAL_MS);
 
-  // Periodic heartbeat to all peers
-  if (SELF_URL) {
+  // Periodic heartbeat to all peers. Runs if either legacy
+  // self-identification (SELF_URL) or signed self-identification
+  // (SELF_HOST) is configured. Per-peer mode dispatch happens inside
+  // heartbeat() via selectAnnounceMode.
+  if (SELF_URL || SELF_HOST) {
     setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
-    console.log(`[gossip] Heartbeat every ${HEARTBEAT_INTERVAL_MS / 60000} minutes`);
+    const intervalDisplay = HEARTBEAT_INTERVAL_MS >= 60000
+      ? `${HEARTBEAT_INTERVAL_MS / 60000} minutes`
+      : `${HEARTBEAT_INTERVAL_MS} ms`;
+    console.log(`[gossip] Heartbeat every ${intervalDisplay}`);
   }
 
   app.listen(PORT, () => {
@@ -2085,4 +2167,5 @@ module.exports = {
   validateSignedAnnounceShape,
   isSignedSelfUpdate,
   validateSignedSelfUpdateShape,
+  selectAnnounceMode,
 };

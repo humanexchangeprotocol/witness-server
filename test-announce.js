@@ -14,6 +14,7 @@ const {
   validateSignedAnnounceShape,
   isSignedSelfUpdate,
   validateSignedSelfUpdateShape,
+  selectAnnounceMode,
 } = require('./server.js');
 
 let passed = 0;
@@ -231,8 +232,62 @@ check('tampered update fails verify',
 // to the update endpoint matches the update-shape check structurally.
 // This is intentional; the route URL is the discriminator, not the
 // payload shape. The shape check just confirms required fields exist.
+// Self-update shape is intentionally a subset of announce; an announce
+// payload (which has extra fields) does NOT match isSignedSelfUpdate
+// only because of structural distinctness... actually it does match,
+// since update fields are all present in announce. The dispatch path
+// in server.js therefore checks isSignedAnnounce first via the
+// /announce route; the /update route is reached only by clients that
+// post to /update, which is itself the disambiguator.
+// We test a realistic case: the announce shape (with peers etc) sent
+// to the update endpoint matches the update-shape check structurally.
+// This is intentional; the route URL is the discriminator, not the
+// payload shape. The shape check just confirms required fields exist.
 check('a full announce payload structurally satisfies update shape too (URL discriminates)',
   isSignedSelfUpdate(signed) === true);
+
+// === Slice 8: heartbeat mode dispatch ===
+
+console.log('');
+console.log('selectAnnounceMode');
+
+const goodSignedRow = {
+  url: 'signed://aaaa@host:3141',
+  pubkey: 'a'.repeat(64),
+  host: '203.0.113.5',
+  port: 3141,
+};
+const legacyRow = {
+  url: 'https://witness.example.com',
+  pubkey: 'b'.repeat(64),
+  host: null,
+  port: null,
+};
+
+check('returns "signed" for a peer with host, port, and pubkey',
+  selectAnnounceMode(goodSignedRow) === 'signed');
+check('returns "legacy" for a peer with no host',
+  selectAnnounceMode(legacyRow) === 'legacy');
+check('returns "legacy" if host is empty string',
+  selectAnnounceMode({ ...goodSignedRow, host: '' }) === 'legacy');
+check('returns "legacy" if host is non-string',
+  selectAnnounceMode({ ...goodSignedRow, host: 42 }) === 'legacy');
+check('returns "legacy" if port is null',
+  selectAnnounceMode({ ...goodSignedRow, port: null }) === 'legacy');
+check('returns "legacy" if port is 0',
+  selectAnnounceMode({ ...goodSignedRow, port: 0 }) === 'legacy');
+check('returns "legacy" if port is 65536',
+  selectAnnounceMode({ ...goodSignedRow, port: 65536 }) === 'legacy');
+check('returns "legacy" if port is float',
+  selectAnnounceMode({ ...goodSignedRow, port: 3141.5 }) === 'legacy');
+check('returns "legacy" if pubkey missing',
+  selectAnnounceMode({ ...goodSignedRow, pubkey: undefined }) === 'legacy');
+check('returns "legacy" if pubkey is bad hex',
+  selectAnnounceMode({ ...goodSignedRow, pubkey: 'xyz' }) === 'legacy');
+check('returns "legacy" for null input',
+  selectAnnounceMode(null) === 'legacy');
+check('returns "legacy" for non-object input',
+  selectAnnounceMode('a peer') === 'legacy');
 
 console.log('');
 console.log('summary  ' + passed + ' passed, ' + failed + ' failed');
