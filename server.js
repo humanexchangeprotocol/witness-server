@@ -518,6 +518,19 @@ async function initDatabase() {
   // the async probe. Filtered to reachable=1 in getActivePeersSigned.
   try { db.run('ALTER TABLE peers ADD COLUMN reachable INTEGER'); } catch(e) {}
 
+  // Slice 9: persistent counters for /stats lifetime aggregates.
+  // Lifetime counts must survive process restart and table cleanup
+  // (witnessed_mints rows older than MINT_RETENTION_DAYS are deleted;
+  // poh_pings similarly). The counters table holds monotonically
+  // increasing values that persist across both. Counters are
+  // bootstrapped from existing data on first boot below.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS counters (
+      key TEXT PRIMARY KEY,
+      value INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+
   // Load lifetime witness count
   const row = db.exec('SELECT COUNT(*) as c FROM witnessed_mints');
   witnessedCount = row.length > 0 ? row[0].values[0][0] : 0;
@@ -530,6 +543,15 @@ async function initDatabase() {
   const pingRow = db.exec('SELECT COUNT(*) as c FROM poh_pings');
   pohPingCount = pingRow.length > 0 ? pingRow[0].values[0][0] : 0;
 
+  // Slice 9: bootstrap counters table from in-memory totals if not
+  // already populated. After bootstrap, every new mint/ping bumps
+  // the counter alongside the in-memory variable, so the two stay
+  // in sync. The counter is what survives /stats reads after a
+  // restart; the in-memory variable is what /status uses for
+  // backwards compatibility.
+  bootstrapCounter('mints_lifetime', witnessedCount);
+  bootstrapCounter('pings_lifetime', pohPingCount);
+
   saveDatabase();
   console.log('[db] Tables ready. Witnessed mints in DB:', row.length > 0 ? row[0].values[0][0] : 0);
 }
@@ -541,6 +563,50 @@ function saveDatabase() {
     fs.writeFileSync(DB_PATH, buffer);
   } catch (e) {
     console.error('[db] Save error:', e.message);
+  }
+}
+
+// === PERSISTENT COUNTERS (slice 9) ===
+// Lifetime aggregate counts that survive process restart and table
+// cleanup. Backed by the counters table (key TEXT PRIMARY KEY,
+// value INTEGER). Accessed only at /stats read time and at write
+// points (mint accept, ping accept). Bootstrap (initDatabase below)
+// seeds them from the existing in-memory totals on first boot.
+
+function getCounter(key) {
+  try {
+    const r = db.exec('SELECT value FROM counters WHERE key = ?', [key]);
+    if (r.length > 0 && r[0].values.length > 0) {
+      return r[0].values[0][0];
+    }
+  } catch (e) {
+    console.error('[counters] read error:', e.message);
+  }
+  return 0;
+}
+
+function incrementCounter(key) {
+  try {
+    db.run(
+      'INSERT INTO counters (key, value) VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET value = value + 1',
+      [key]
+    );
+  } catch (e) {
+    console.error('[counters] increment error:', e.message);
+  }
+}
+
+// bootstrapCounter sets a counter to `seed` only if no row exists yet
+// for `key`. Used at boot to migrate existing in-memory totals into
+// the persistent table without overwriting subsequent increments.
+function bootstrapCounter(key, seed) {
+  try {
+    const r = db.exec('SELECT 1 FROM counters WHERE key = ?', [key]);
+    if (r.length === 0 || r[0].values.length === 0) {
+      db.run('INSERT INTO counters (key, value) VALUES (?, ?)', [key, Number.isInteger(seed) ? seed : 0]);
+    }
+  } catch (e) {
+    console.error('[counters] bootstrap error:', e.message);
   }
 }
 
@@ -673,6 +739,7 @@ app.post('/witness', (req, res) => {
     );
 
     witnessedCount++;
+    incrementCounter('mints_lifetime');
     saveDatabase();
 
     console.log(`[witness] New attestation: ${mint_hash.substring(0, 16)}...`);
@@ -767,6 +834,7 @@ app.post('/ping', (req, res) => {
     updatePresence(chain_fingerprint, sensor_hash, 'ping');
 
     pohPingCount++;
+    incrementCounter('pings_lifetime');
     saveDatabase();
 
     console.log(`[ping] PoH attestation: chain ${chain_fingerprint.substring(0, 8)}... seq ${seq || 0} challenged=${challenged}`);
@@ -1515,6 +1583,64 @@ app.get('/status', (req, res) => {
   });
 });
 
+// --- GET /stats ---
+// Public-facing aggregate counts for the marketing-site admin
+// dashboard. Distinct from /status: /stats is non-operational
+// (no pending pairs, no active sessions, no traffic-pattern
+// signals), and lifetime totals come from the persistent counters
+// table so they survive restart and table cleanup.
+//
+// Window definitions:
+// - today  = events created in the last 24 hours
+// - week   = events created in the last 7 days
+// - lifetime = persistent counter (counters table)
+//
+// Lifetime can exceed today/week + (older rows) because the rows
+// table is subject to retention cleanup. The counter is the
+// monotonic source of truth for lifetime; the rows table answers
+// "today/week" via timestamp filter.
+app.get('/stats', (req, res) => {
+  const now = Math.floor(Date.now() / 1000);
+  const oneDayAgo = now - 24 * 60 * 60;
+  const oneWeekAgo = now - 7 * 24 * 60 * 60;
+
+  function countSince(table, column, ts) {
+    const r = db.exec(`SELECT COUNT(*) FROM ${table} WHERE ${column} >= ?`, [ts]);
+    return r.length > 0 ? r[0].values[0][0] : 0;
+  }
+
+  // Peer summaries.
+  const totalActive = db.exec(
+    'SELECT COUNT(*) FROM peers WHERE last_heartbeat >= ?',
+    [now - PEER_STALE_HOURS * 60 * 60]
+  );
+  const reachableSigned = db.exec(
+    'SELECT COUNT(*) FROM peers WHERE last_heartbeat >= ? AND host IS NOT NULL AND port IS NOT NULL AND reachable = 1',
+    [now - PEER_STALE_HOURS * 60 * 60]
+  );
+
+  res.json({
+    server_pubkey: serverKeys.publicKeyHex,
+    version: VERSION,
+    uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+    mints: {
+      today: countSince('witnessed_mints', 'created_at', oneDayAgo),
+      week: countSince('witnessed_mints', 'created_at', oneWeekAgo),
+      lifetime: getCounter('mints_lifetime'),
+    },
+    pings: {
+      today: countSince('poh_pings', 'created_at', oneDayAgo),
+      week: countSince('poh_pings', 'created_at', oneWeekAgo),
+      lifetime: getCounter('pings_lifetime'),
+    },
+    peers: {
+      signed: reachableSigned.length > 0 ? reachableSigned[0].values[0][0] : 0,
+      total: totalActive.length > 0 ? totalActive[0].values[0][0] : 0,
+    },
+    as_of: now,
+  });
+});
+
 // --- POST /pair ---
 // Phone submits one half of a pairing code exchange
 app.post('/pair', (req, res) => {
@@ -2141,6 +2267,7 @@ async function start() {
     console.log(`         GET  /peers       list active servers`);
     console.log(`         POST /update      signed self-update broadcast`);
     console.log(`         GET  /status      health check`);
+    console.log(`         GET  /stats       public-facing aggregate counts`);
     console.log('');
 
     // Initial heartbeat after startup (give server 2 seconds to settle)

@@ -599,6 +599,56 @@ async function main() {
   procB2.kill();
   await new Promise(r => setTimeout(r, 200));
 
+  // === Slice 9: /stats endpoint ===
+  // Public-facing aggregate counts. Lifetime values come from the
+  // persistent counters table; today/week come from row queries with
+  // timestamp filters. Distinct from /status (operator-detail).
+  console.log('');
+  console.log('Slice 9: GET /stats shape and behavior');
+
+  const rStats = await fetch(`http://localhost:${PORT}/stats`);
+  check('/stats returns 200', rStats.status === 200, 'got ' + rStats.status);
+  const dStats = await rStats.json();
+
+  check('/stats has server_pubkey matching server', dStats.server_pubkey === serverPubkey);
+  check('/stats has version string', typeof dStats.version === 'string');
+  check('/stats has uptime_seconds integer', Number.isInteger(dStats.uptime_seconds));
+  check('/stats has as_of unix-seconds timestamp', Number.isInteger(dStats.as_of));
+
+  check('/stats has mints object', dStats.mints && typeof dStats.mints === 'object');
+  check('/stats mints.today is integer', Number.isInteger(dStats.mints.today));
+  check('/stats mints.week is integer', Number.isInteger(dStats.mints.week));
+  check('/stats mints.lifetime is integer', Number.isInteger(dStats.mints.lifetime));
+
+  check('/stats has pings object', dStats.pings && typeof dStats.pings === 'object');
+  check('/stats pings.today is integer', Number.isInteger(dStats.pings.today));
+  check('/stats pings.week is integer', Number.isInteger(dStats.pings.week));
+  check('/stats pings.lifetime is integer', Number.isInteger(dStats.pings.lifetime));
+
+  check('/stats has peers object', dStats.peers && typeof dStats.peers === 'object');
+  check('/stats peers.signed is integer', Number.isInteger(dStats.peers.signed));
+  check('/stats peers.total is integer', Number.isInteger(dStats.peers.total));
+
+  // /stats must not leak operational fields that /status carries.
+  check('/stats does not expose pending_relays', dStats.pending_relays === undefined);
+  check('/stats does not expose pending_pairs', dStats.pending_pairs === undefined);
+  check('/stats does not expose pending_proposals', dStats.pending_proposals === undefined);
+  check('/stats does not expose active_sessions', dStats.active_sessions === undefined);
+
+  // After the slice 4-8 activity in this test run, server A has had
+  // signed announces but no /witness or /ping calls, so mints/pings
+  // counts are all zero. Peers.signed should be 0 because procB was
+  // killed (its row stays in DB but cutoff filter still passes; the
+  // probe success was earlier so reachable=1 was set; the row is
+  // still active until PEER_STALE_HOURS elapse). Be tolerant about
+  // exact peer counts since multiple announces happened in this
+  // single-server scenario.
+  check('/stats mints.lifetime is 0 (no /witness calls in this run)', dStats.mints.lifetime === 0);
+  check('/stats pings.lifetime is 0 (no /ping calls in this run)', dStats.pings.lifetime === 0);
+  check('/stats peers.total is non-negative', dStats.peers.total >= 0);
+  check('/stats peers.signed is non-negative', dStats.peers.signed >= 0);
+  check('/stats peers.signed <= peers.total', dStats.peers.signed <= dStats.peers.total);
+
   // === Done ===
   console.log('');
   console.log('summary  ' + passed + ' passed, ' + failed + ' failed');
