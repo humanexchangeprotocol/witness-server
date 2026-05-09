@@ -242,6 +242,68 @@ function validateSignedSelfUpdateShape(body) {
   return null;
 }
 
+// === REACHABILITY (witness-identity-protocol §9, slice 7) ===
+// When a signed announce or self-update is accepted, the receiver
+// fires an HTTP GET to the announced endpoint's /status and confirms
+// the returned server_pubkey matches the pubkey the announcer claimed.
+// This is the binding-consistency check that catches IP recycling: a
+// witness moves IP, the old IP is now answered by a different machine
+// running HEP software with a different pubkey; without this check
+// the network keeps sending traffic to the wrong machine.
+//
+// The probe is async fire-and-forget. handleSignedAnnounce returns
+// immediately; the peer is initially inserted with reachable=0 and
+// updated to reachable=1 by the probe when (and only if) it succeeds.
+// Peers with reachable!=1 are excluded from signed /peers responses.
+//
+// The async pattern also avoids a DoS surface: if the probe were
+// synchronous, an attacker could announce themselves at a slow
+// endpoint and tie up announce-handler time up to the probe timeout.
+// Async means the announce path always returns in milliseconds.
+//
+// HCP_PROBE_DISABLED env var skips the probe entirely (peer stays at
+// reachable=0). Useful in test environments or for operators on
+// networks where outbound HTTP is blocked. Default is probe enabled.
+
+const PROBE_TIMEOUT_MS = 5000;
+const PROBE_DISABLED = process.env.HCP_PROBE_DISABLED === '1';
+
+async function probeReachability(host, port, expectedPubkey) {
+  try {
+    const resp = await fetch(`http://${host}:${port}/status`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return data.server_pubkey === expectedPubkey;
+  } catch {
+    return false;
+  }
+}
+
+// triggerReachabilityProbe runs the probe asynchronously and updates
+// the peer's reachable flag when it resolves. The UPDATE matches
+// pubkey AND host AND port, so a stale probe result does not
+// overwrite a newer announce that changed the endpoint while the
+// probe was in flight.
+function triggerReachabilityProbe(host, port, pubkey) {
+  if (PROBE_DISABLED) return;
+  probeReachability(host, port, pubkey)
+    .then(ok => {
+      try {
+        db.run(
+          'UPDATE peers SET reachable = ? WHERE pubkey = ? AND host = ? AND port = ?',
+          [ok ? 1 : 0, pubkey, host, port]
+        );
+        saveDatabase();
+        console.log(`[probe] ${pubkey.slice(0, 12)} at ${host}:${port} reachable=${ok}`);
+      } catch (e) {
+        console.error('[probe] DB update failed:', e.message);
+      }
+    })
+    .catch(() => {});
+}
+
 // === DATABASE ===
 
 async function initDatabase() {
@@ -427,6 +489,13 @@ async function initDatabase() {
   try { db.run('ALTER TABLE peers ADD COLUMN port INTEGER'); } catch(e) {}
   try { db.run('ALTER TABLE peers ADD COLUMN last_sequence INTEGER'); } catch(e) {}
   try { db.run('ALTER TABLE peers ADD COLUMN last_signed_at INTEGER'); } catch(e) {}
+
+  // Slice 7: reachability flag per witness-identity-protocol §9.
+  // 0 = not yet probed or probe failed; 1 = probe succeeded (HTTP GET
+  // /status returned matching server_pubkey within 5 seconds).
+  // Signed-mode peers are inserted with reachable=0 and updated by
+  // the async probe. Filtered to reachable=1 in getActivePeersSigned.
+  try { db.run('ALTER TABLE peers ADD COLUMN reachable INTEGER'); } catch(e) {}
 
   // Load lifetime witness count
   const row = db.exec('SELECT COUNT(*) as c FROM witnessed_mints');
@@ -931,10 +1000,16 @@ function handleSignedAnnounce(req, res) {
 
   // Synthesize url for primary-key purposes; signed-mode rows are
   // logically keyed by pubkey (DELETE WHERE pubkey = ? then INSERT).
-  const synthesized = `http://${body.endpoint.host}:${body.endpoint.port}`;
+  // The synthesis includes the pubkey so two different pubkeys
+  // claiming the same endpoint do not collide on the primary key
+  // (the reachability check disambiguates which one is the real
+  // binding). reachable starts at 0 and is updated to 1 by the async
+  // probe (triggerReachabilityProbe below) if /status confirms the
+  // pubkey-to-endpoint binding.
+  const synthesized = `signed://${body.pubkey}@${body.endpoint.host}:${body.endpoint.port}`;
   db.run('DELETE FROM peers WHERE pubkey = ?', [body.pubkey]);
   db.run(
-    'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port, last_sequence, last_signed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port, last_sequence, last_signed_at, reachable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     [
       synthesized,
       body.pubkey,
@@ -946,8 +1021,13 @@ function handleSignedAnnounce(req, res) {
       body.endpoint.port,
       body.sequence,
       body.signed_at,
+      0,
     ]
   );
+
+  // Fire async reachability probe (§9). Non-blocking; updates the
+  // row's reachable flag when the probe resolves.
+  triggerReachabilityProbe(body.endpoint.host, body.endpoint.port, body.pubkey);
 
   // Process gossip-list entries. We accept new pubkeys for storage but
   // never overwrite an existing pubkey's row from gossip; trust comes
@@ -965,7 +1045,7 @@ function handleSignedAnnounce(req, res) {
       if (!Number.isInteger(pPort) || pPort < 1 || pPort > 65535) continue;
       const known = db.exec('SELECT pubkey FROM peers WHERE pubkey = ?', [p.pubkey]);
       if (known.length === 0 || known[0].values.length === 0) {
-        const pUrl = `http://${pHost}:${pPort}`;
+        const pUrl = `signed://${p.pubkey}@${pHost}:${pPort}`;
         db.run(
           'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
           [pUrl, p.pubkey, '?', 0, p.last_seen || now, now, pHost, pPort]
@@ -1088,10 +1168,10 @@ app.post('/update', (req, res) => {
       }
     }
 
-    const synthesized = `http://${body.endpoint.host}:${body.endpoint.port}`;
+    const synthesized = `signed://${body.pubkey}@${body.endpoint.host}:${body.endpoint.port}`;
     db.run('DELETE FROM peers WHERE pubkey = ?', [body.pubkey]);
     db.run(
-      'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port, last_sequence, last_signed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port, last_sequence, last_signed_at, reachable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         synthesized,
         body.pubkey,
@@ -1103,10 +1183,14 @@ app.post('/update', (req, res) => {
         body.endpoint.port,
         body.sequence,
         body.signed_at,
+        0,
       ]
     );
     saveDatabase();
     console.log(`[gossip] Self-update from ${body.pubkey.slice(0, 12)} -> ${body.endpoint.host}:${body.endpoint.port} seq=${body.sequence}`);
+
+    // The endpoint changed; re-probe to confirm the new binding (§9).
+    triggerReachabilityProbe(body.endpoint.host, body.endpoint.port, body.pubkey);
 
     res.json({ accepted: true });
   } catch (e) {
@@ -1135,13 +1219,15 @@ function getActivePeers() {
 
 // getActivePeersSigned returns the peer list in the signed-format shape
 // (witness-identity-protocol §6.1 and §6.2). Only peers we have host/port
-// data for are returned; legacy url-only peers are not yet representable
-// in the signed wire format and will surface here once they upgrade and
-// re-announce in signed mode.
+// data for AND that have passed the §9 reachability probe (reachable=1)
+// are returned. Legacy url-only peers and signed-mode peers whose probe
+// has not yet succeeded are excluded; both surface here once they
+// announce successfully and the probe to their endpoint confirms the
+// pubkey binding.
 function getActivePeersSigned() {
   const cutoff = Math.floor(Date.now() / 1000) - (PEER_STALE_HOURS * 60 * 60);
   const result = db.exec(
-    'SELECT pubkey, host, port, version, last_heartbeat FROM peers WHERE last_heartbeat >= ? AND host IS NOT NULL AND port IS NOT NULL',
+    'SELECT pubkey, host, port, version, last_heartbeat FROM peers WHERE last_heartbeat >= ? AND host IS NOT NULL AND port IS NOT NULL AND reachable = 1',
     [cutoff]
   );
   if (result.length === 0) return [];
@@ -1278,7 +1364,7 @@ async function announceSignedToServer(targetUrl, targetPubkey) {
         if (!Number.isInteger(pPort) || pPort < 1 || pPort > 65535) continue;
         const known = db.exec('SELECT pubkey FROM peers WHERE pubkey = ?', [p.pubkey]);
         if (known.length === 0 || known[0].values.length === 0) {
-          const pUrl = `http://${pHost}:${pPort}`;
+          const pUrl = `signed://${p.pubkey}@${pHost}:${pPort}`;
           db.run(
             'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [pUrl, p.pubkey, p.version || '?', 0, p.last_seen || tNow, tNow, pHost, pPort]
