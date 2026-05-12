@@ -34,7 +34,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.3.1';
+const VERSION = '2.4.0';
 
 let db = null;
 let serverKeys = null;
@@ -291,7 +291,14 @@ const PROBE_DISABLED = process.env.HCP_PROBE_DISABLED === '1';
 
 async function probeReachability(host, port, expectedPubkey) {
   try {
-    const resp = await fetch(`http://${host}:${port}/status`, {
+    // Infer scheme from port. Operators commonly front witnesses with
+    // nginx + TLS cert on 443 (the testbed pattern); all other ports
+    // default to plain HTTP. This avoids a wire-format change while
+    // covering the realistic deployment shapes. If a future operator
+    // runs HTTPS on a non-443 port, the wire format needs a scheme
+    // field; pinned as a Component 3 follow-up if that case appears.
+    const scheme = port === 443 ? 'https' : 'http';
+    const resp = await fetch(`${scheme}://${host}:${port}/status`, {
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
     if (!resp.ok) return false;
@@ -1535,11 +1542,30 @@ async function heartbeat() {
   let signedCount = 0;
   let legacyCount = 0;
   for (const peer of peers) {
-    const mode = selectAnnounceMode(peer);
-    if (mode === 'signed' && SELF_HOST) {
-      signedCount += 1;
-      await announceSignedToServer(`http://${peer.host}:${peer.port}`, peer.pubkey);
-    } else {
+    // v2.4.0: send signed whenever WE can (SELF_HOST set) and we have
+    // the peer's pubkey, regardless of whether the peer row carries
+    // host/port. Peers learned via legacy bootstrap have url+pubkey
+    // only; before this change those would stay in legacy gossip
+    // forever because selectAnnounceMode requires host+port. Target URL
+    // is host:port if known (still the protocol's preferred shape),
+    // else the legacy url we have on file. announceSignedToServer
+    // already accepts a URL as destination; receiver-side handling
+    // is shape-driven, not URL-driven.
+    const canSendSigned =
+      SELF_HOST &&
+      typeof peer.pubkey === 'string' &&
+      /^[0-9a-f]{64}$/i.test(peer.pubkey);
+    if (canSendSigned) {
+      const targetUrl = (peer.host && peer.port)
+        ? `http://${peer.host}:${peer.port}`
+        : peer.url;
+      if (targetUrl) {
+        signedCount += 1;
+        await announceSignedToServer(targetUrl, peer.pubkey);
+        continue;
+      }
+    }
+    if (peer.url) {
       legacyCount += 1;
       await announceToServer(peer.url);
     }
