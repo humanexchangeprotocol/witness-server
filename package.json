@@ -1,1 +1,1 @@
-{"name":"hep-witness","version":"2.4.0","dependencies":{"express":"^4.18.0","cors":"^2.8.5","tweetnacl":"^1.0.3","tweetnacl-util":"^0.15.1","sql.js":"^1.8.0"}}
+{"name":"hep-witness","version":"2.4.1","dependencies":{"express":"^4.18.0","cors":"^2.8.5","tweetnacl":"^1.0.3","tweetnacl-util":"^0.15.1","sql.js":"^1.8.0"}}

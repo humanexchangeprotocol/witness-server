@@ -34,7 +34,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.4.0';
+const VERSION = '2.4.1';
 
 let db = null;
 let serverKeys = null;
@@ -289,15 +289,24 @@ function selectAnnounceMode(peerRow) {
 const PROBE_TIMEOUT_MS = 5000;
 const PROBE_DISABLED = process.env.HCP_PROBE_DISABLED === '1';
 
+// schemeForPort returns the URL scheme to use when contacting a peer
+// at a given port. Operators commonly front witnesses with nginx + TLS
+// cert on 443 (the testbed pattern); all other ports default to plain
+// HTTP. This avoids a wire-format change while covering the realistic
+// deployment shapes. If a future operator runs HTTPS on a non-443
+// port, the wire format needs a scheme field; pinned as a Component 3
+// follow-up if that case appears.
+//
+// Used by probeReachability (§9 probe) and the heartbeat outbound
+// dispatch. Keep both paths going through this helper so the
+// inferred scheme cannot drift between probe and dispatch.
+function schemeForPort(port) {
+  return port === 443 ? 'https' : 'http';
+}
+
 async function probeReachability(host, port, expectedPubkey) {
   try {
-    // Infer scheme from port. Operators commonly front witnesses with
-    // nginx + TLS cert on 443 (the testbed pattern); all other ports
-    // default to plain HTTP. This avoids a wire-format change while
-    // covering the realistic deployment shapes. If a future operator
-    // runs HTTPS on a non-443 port, the wire format needs a scheme
-    // field; pinned as a Component 3 follow-up if that case appears.
-    const scheme = port === 443 ? 'https' : 'http';
+    const scheme = schemeForPort(port);
     const resp = await fetch(`${scheme}://${host}:${port}/status`, {
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
@@ -1556,8 +1565,14 @@ async function heartbeat() {
       typeof peer.pubkey === 'string' &&
       /^[0-9a-f]{64}$/i.test(peer.pubkey);
     if (canSendSigned) {
+      // Target URL is host:port if known (the protocol's preferred
+      // shape), else the legacy url we have on file. Scheme inferred
+      // from port via schemeForPort, the same way the §9 probe does.
+      // Pre-v2.4.1 this line hardcoded http://, which produced HTTP
+      // 400 from any TLS-fronted peer on port 443; fix locked in by
+      // routing both probe and dispatch through the same helper.
       const targetUrl = (peer.host && peer.port)
-        ? `http://${peer.host}:${peer.port}`
+        ? `${schemeForPort(peer.port)}://${peer.host}:${peer.port}`
         : peer.url;
       if (targetUrl) {
         signedCount += 1;
