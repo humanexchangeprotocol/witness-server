@@ -196,6 +196,18 @@ To remove the witness fully, also delete `~/witness-server`. Back up `server_key
 
 ---
 
+## Operator hygiene
+
+A few rules that keep upgrades and diagnostics predictable.
+
+**Never hand-edit `server.js` or `package.json` in your install directory.** The working tree must stay clean. If `git status` ever shows modified or untracked changes inside the witness directory, the next `git pull` either fails or merges unpredictably, and a future upgrade will silently include or break your hand-edit. To change behavior, use environment variables (see below). To change code, fork the repo, push your change there, and have your install track your fork; that keeps the working tree consistent with its origin.
+
+**Backups stay outside the working tree.** When upgrading, put backup files in a sibling directory (for example `/opt/hep-witness.backup-2026-05-13/`) rather than inside the install directory. Backup files like `server.js.pre-2.5.0` accumulating inside the install directory clutter `git status` and create the same drift problem as hand-edits.
+
+**Inspect, do not modify, while the witness is running.** `cat`, `tail -f`, `journalctl`, `/status`, and `/peers` are all safe against a running witness. Stop the witness (`sudo systemctl stop hep-witness`) before any procedure that changes files in the working tree.
+
+---
+
 ## Upgrade path
 
 The witness upgrades by replacing the source code while preserving the three state files (`server_key.json`, `witness.db`, `server_state.json`). The pubkey-as-identity property is the property that lets upgrades happen without re-bootstrapping anything else on the network.

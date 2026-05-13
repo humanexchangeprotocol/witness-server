@@ -34,7 +34,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 
 let db = null;
 let serverKeys = null;
@@ -1542,9 +1542,21 @@ async function heartbeat() {
 
   // Seed peers (legacy URLs from HCP_SEEDS env). We have no pubkey
   // for these until they reply, so dispatch is always legacy.
-  const seedTargets = SEED_PEERS.filter(s =>
-    s !== selfClean && !peers.some(p => p.url === s)
-  );
+  // Dedupe: skip a seed if any peer row already covers it. A signed-
+  // mode peer's url is synthesized (signed://pubkey@host:port) and
+  // does not literally equal the seed string, so we also compare
+  // hostnames against the host column. Without this, the same logical
+  // peer is announced twice per heartbeat (once signed, once legacy).
+  const seedTargets = SEED_PEERS.filter(s => {
+    if (s === selfClean) return false;
+    if (peers.some(p => p.url === s)) return false;
+    try {
+      const sHost = new URL(s).hostname;
+      return !peers.some(p => p.host === sHost);
+    } catch {
+      return true;
+    }
+  });
 
   if (peers.length === 0 && seedTargets.length === 0) return;
 
