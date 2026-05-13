@@ -34,7 +34,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.4.1';
+const VERSION = '2.5.0';
 
 let db = null;
 let serverKeys = null;
@@ -1678,6 +1678,44 @@ app.get('/stats', (req, res) => {
       signed: reachableSigned.length > 0 ? reachableSigned[0].values[0][0] : 0,
       total: totalActive.length > 0 ? totalActive[0].values[0][0] : 0,
     },
+    as_of: now,
+  });
+});
+
+// --- GET /stats/daily ---
+// Per-day attestation counts for the marketing-site analytics
+// dashboard. Returns mints (and pings) grouped by UTC day for the
+// last N days (default 30, max 365 via ?days=).
+//
+// Unauthenticated and intended for public consumption: the counts
+// themselves do not leak operational signal beyond what /stats
+// already publishes. No per-actor or per-payload data is exposed.
+app.get('/stats/daily', (req, res) => {
+  const daysParam = parseInt(req.query.days, 10);
+  const days = Math.max(1, Math.min(365, isNaN(daysParam) ? 30 : daysParam));
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = now - days * 24 * 60 * 60;
+
+  function dailyBuckets(table, column) {
+    // SQLite has date() that takes a unix epoch with the 'unixepoch'
+    // modifier. Group by that to get one row per UTC day.
+    const r = db.exec(
+      `SELECT date(${column}, 'unixepoch') AS day, COUNT(*) AS count
+       FROM ${table}
+       WHERE ${column} >= ?
+       GROUP BY day
+       ORDER BY day DESC`,
+      [cutoff]
+    );
+    if (r.length === 0) return [];
+    return r[0].values.map(row => ({ day: row[0], count: row[1] }));
+  }
+
+  res.json({
+    server_pubkey: serverKeys.publicKeyHex,
+    window_days: days,
+    days: dailyBuckets('witnessed_mints', 'created_at'),
+    pings: dailyBuckets('poh_pings', 'created_at'),
     as_of: now,
   });
 });
