@@ -23,6 +23,7 @@ const MINT_RETENTION_DAYS = 30;
 const RELAY_RETENTION_HOURS = 72;
 const PAIR_RETENTION_DAYS = 7;
 const SESSION_RETENTION_HOURS = 24; // Sessions are ephemeral, 24 hour max
+const PIPE_RETENTION_HOURS = 24; // Invite pipes are ephemeral, 24 hour max (matches sessions)
 const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HCP_HEARTBEAT_INTERVAL_MS, 10) || (15 * 60 * 1000); // default 15 minutes; env override in seconds*1000 for test/operator tuning
@@ -34,7 +35,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.5.1';
+const VERSION = '2.6.0';
 
 let db = null;
 let serverKeys = null;
@@ -437,6 +438,40 @@ async function initDatabase() {
     )
   `);
 
+  // Invite pipes (code-introduction layer on top of sessions).
+  // A pipe is a temporary rendezvous reference carried in a QR code.
+  // Redemption introduces session codes to both sides; the existing
+  // session machinery then runs unchanged. The pipe never carries an
+  // exchange: the mint always requires both phones' signatures, made
+  // through the normal session flow after introduction.
+  // max_redemptions: 1 = single invite (first redemption claims the
+  // pipe), 0 = uncapped room mode (open until closed or expired).
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pipes (
+      pipe_code TEXT PRIMARY KEY,
+      owner_fingerprint TEXT NOT NULL,
+      owner_public_key TEXT NOT NULL,
+      owner_name TEXT,
+      max_redemptions INTEGER NOT NULL DEFAULT 1,
+      redemption_count INTEGER NOT NULL DEFAULT 0,
+      closed INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pipe_redemptions (
+      pipe_code TEXT NOT NULL,
+      redeemer_code TEXT NOT NULL,
+      owner_code TEXT NOT NULL,
+      redeemer_fingerprint TEXT NOT NULL,
+      redeemer_public_key TEXT NOT NULL,
+      redeemer_name TEXT,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (pipe_code, redeemer_code)
+    )
+  `);
+
   // Create indexes for cleanup queries
   db.run('CREATE INDEX IF NOT EXISTS idx_mints_created ON witnessed_mints(created_at)');
   db.run('CREATE INDEX IF NOT EXISTS idx_relay_created ON settlement_relay(created_at)');
@@ -652,6 +687,10 @@ function runCleanup() {
   const sessionCount = expiredSessions.length > 0 ? expiredSessions[0].values.length : 0;
   db.run('DELETE FROM sessions WHERE created_at < ?', [sessionCutoff]);
   db.run('DELETE FROM session_proposals WHERE created_at < ?', [sessionCutoff]);
+  // Clean up expired invite pipes and their redemption rows (ephemeral, 24 hours max)
+  const pipeCutoff = now - (PIPE_RETENTION_HOURS * 60 * 60);
+  db.run('DELETE FROM pipe_redemptions WHERE created_at < ?', [pipeCutoff]);
+  db.run('DELETE FROM pipes WHERE created_at < ?', [pipeCutoff]);
   // Clean up expired ping challenges (60 seconds max)
   db.run('DELETE FROM ping_challenges WHERE created_at < ?', [now - 60]);
   if (sessionCount > 0) {
@@ -2282,6 +2321,240 @@ app.post('/session/:code/confirm', (req, res) => {
   }
 });
 
+// === INVITE PIPES ===
+// Code-introduction layer on top of sessions (writing/invite-pipeline.md
+// in hep-project-state). The QR carries the pipe, never the exchange.
+// Lifecycle: open -> (claimed when cap reached) -> closed/expired.
+// Security model: pipe closure and claim-binding are hygiene against
+// forwarded/photographed QRs; the inviter's per-record signature in the
+// normal session flow is the security. Redemption mints nothing.
+
+// Pipe codes are client-generated, 10 chars from the language-proof
+// charset (no O/I/L/S/B). Longer than session codes because a pipe is
+// semi-public (displayed in a room) and lives up to 24 hours.
+function validPipeCode(code) {
+  return typeof code === 'string' && /^[ACDEFGHJKMNPQRTUVWXYZ]{10}$/.test(code);
+}
+
+// Display names ride in the pipe so the redeemer's accept flow can show
+// who opened it. Bounded to keep rows small; empty/absent is fine.
+function validPipeName(name) {
+  return name === undefined || name === null ||
+    (typeof name === 'string' && name.length <= 80);
+}
+
+// Shape validators (pure, exported for tests).
+function validatePipeCreateShape(body) {
+  if (!body || typeof body !== 'object') return 'not an object';
+  if (!validPipeCode(body.pipe_code)) return 'invalid pipe_code';
+  if (typeof body.fingerprint !== 'string' || !body.fingerprint) return 'missing fingerprint';
+  if (body.public_key === undefined || body.public_key === null) return 'missing public_key';
+  if (!validPipeName(body.name)) return 'invalid name';
+  const cap = body.max_redemptions;
+  if (cap !== undefined && (!Number.isInteger(cap) || cap < 0 || cap > 500)) return 'invalid max_redemptions';
+  return null;
+}
+
+function validatePipeRedeemShape(body) {
+  if (!body || typeof body !== 'object') return 'not an object';
+  if (typeof body.redeemer_code !== 'string' || !/^[A-Z]{4}$/.test(body.redeemer_code)) return 'invalid redeemer_code';
+  if (typeof body.fingerprint !== 'string' || !body.fingerprint) return 'missing fingerprint';
+  if (body.public_key === undefined || body.public_key === null) return 'missing public_key';
+  if (!validPipeName(body.name)) return 'invalid name';
+  return null;
+}
+
+// Server-generated owner-side session code for one pairing. Same
+// 4-char language-proof charset the app uses. Uniqueness is checked
+// against live sessions and pending redemptions by the caller.
+const PIPE_PAIR_CHARS = 'ACDEFGHJKMNPQRTUVWXYZ';
+function generateOwnerCode() {
+  const bytes = crypto.randomBytes(4);
+  let out = '';
+  for (let i = 0; i < 4; i++) out += PIPE_PAIR_CHARS[bytes[i] % PIPE_PAIR_CHARS.length];
+  return out;
+}
+
+function uniqueOwnerCode() {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const code = generateOwnerCode();
+    const inSessions = db.exec('SELECT my_code FROM sessions WHERE my_code = ? OR their_code = ?', [code, code]);
+    const inRedemptions = db.exec('SELECT owner_code FROM pipe_redemptions WHERE owner_code = ? OR redeemer_code = ?', [code, code]);
+    const taken = (inSessions.length > 0 && inSessions[0].values.length > 0) ||
+      (inRedemptions.length > 0 && inRedemptions[0].values.length > 0);
+    if (!taken) return code;
+  }
+  return null; // astronomically unlikely with a healthy table
+}
+
+// --- POST /pipe ---
+// Inviter opens a pipe. Body: { pipe_code, fingerprint, public_key,
+// name?, max_redemptions? } (1 = single invite, 0 = uncapped room).
+app.post('/pipe', (req, res) => {
+  try {
+    const shapeError = validatePipeCreateShape(req.body);
+    if (shapeError) return res.status(400).json({ error: shapeError });
+
+    const { pipe_code, fingerprint, public_key, name } = req.body;
+    const cap = req.body.max_redemptions === undefined ? 1 : req.body.max_redemptions;
+    const now = Math.floor(Date.now() / 1000);
+
+    const existing = db.exec('SELECT owner_fingerprint FROM pipes WHERE pipe_code = ?', [pipe_code]);
+    if (existing.length > 0 && existing[0].values.length > 0) {
+      // Idempotent re-create by the same owner; collision by anyone else.
+      if (existing[0].values[0][0] === fingerprint) return res.json({ created: true, pipe_code });
+      return res.status(409).json({ error: 'Pipe code in use' });
+    }
+
+    db.run(
+      'INSERT INTO pipes (pipe_code, owner_fingerprint, owner_public_key, owner_name, max_redemptions, redemption_count, closed, created_at) VALUES (?, ?, ?, ?, ?, 0, 0, ?)',
+      [pipe_code, fingerprint, JSON.stringify(public_key), name || null, cap, now]
+    );
+    saveDatabase();
+    console.log(`[pipe] Opened: ${pipe_code} (cap ${cap === 0 ? 'uncapped' : cap})`);
+    res.json({ created: true, pipe_code });
+  } catch (e) {
+    console.error('[pipe] CREATE error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- POST /pipe/:code/redeem ---
+// Scanner redeems the pipe with a freshly generated session code.
+// Response introduces the owner and a server-generated owner-side
+// session code for this pairing, so the redeemer can immediately
+// join the normal session machinery. Idempotent per redeemer.
+app.post('/pipe/:code/redeem', (req, res) => {
+  try {
+    const pipeCode = req.params.code;
+    if (!validPipeCode(pipeCode)) return res.status(400).json({ error: 'Invalid pipe code' });
+    const shapeError = validatePipeRedeemShape(req.body);
+    if (shapeError) return res.status(400).json({ error: shapeError });
+
+    const { redeemer_code, fingerprint, public_key, name } = req.body;
+
+    const pipeRows = db.exec(
+      'SELECT owner_fingerprint, owner_public_key, owner_name, max_redemptions, redemption_count, closed, created_at FROM pipes WHERE pipe_code = ?',
+      [pipeCode]
+    );
+    if (pipeRows.length === 0 || pipeRows[0].values.length === 0) {
+      return res.status(404).json({ accepted: false, reason: 'not_found' });
+    }
+    const [ownerFp, ownerKey, ownerName, cap, count, closed, createdAt] = pipeRows[0].values[0];
+
+    const now = Math.floor(Date.now() / 1000);
+    if (now - createdAt > PIPE_RETENTION_HOURS * 60 * 60) {
+      return res.json({ accepted: false, reason: 'expired' });
+    }
+    if (closed) return res.json({ accepted: false, reason: 'closed' });
+
+    // Idempotent retry: same redeemer, same answer.
+    const prior = db.exec(
+      'SELECT owner_code FROM pipe_redemptions WHERE pipe_code = ? AND redeemer_fingerprint = ?',
+      [pipeCode, fingerprint]
+    );
+    if (prior.length > 0 && prior[0].values.length > 0) {
+      return res.json({
+        accepted: true,
+        owner_code: prior[0].values[0][0],
+        owner: { name: ownerName || '', public_key: ownerKey ? JSON.parse(ownerKey) : null, fingerprint: ownerFp },
+      });
+    }
+
+    if (cap !== 0 && count >= cap) {
+      return res.json({ accepted: false, reason: 'claimed' });
+    }
+
+    const ownerCode = uniqueOwnerCode();
+    if (!ownerCode) return res.status(500).json({ error: 'Could not allocate code' });
+
+    db.run(
+      'INSERT INTO pipe_redemptions (pipe_code, redeemer_code, owner_code, redeemer_fingerprint, redeemer_public_key, redeemer_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [pipeCode, redeemer_code, ownerCode, fingerprint, JSON.stringify(public_key), name || null, now]
+    );
+    db.run('UPDATE pipes SET redemption_count = redemption_count + 1 WHERE pipe_code = ?', [pipeCode]);
+    saveDatabase();
+    console.log(`[pipe] Redeemed: ${pipeCode} (${count + 1}${cap === 0 ? '' : '/' + cap})`);
+
+    res.json({
+      accepted: true,
+      owner_code: ownerCode,
+      owner: { name: ownerName || '', public_key: ownerKey ? JSON.parse(ownerKey) : null, fingerprint: ownerFp },
+    });
+  } catch (e) {
+    console.error('[pipe] REDEEM error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- GET /pipe/:code/owner ---
+// Inviter polls for redemptions. Requires the owner fingerprint so a
+// bystander who can see the QR cannot enumerate who redeemed. Bearer
+// strength matches the rest of the session layer; the per-record
+// signature downstream is the real gate.
+app.get('/pipe/:code/owner', (req, res) => {
+  try {
+    const pipeCode = req.params.code;
+    if (!validPipeCode(pipeCode)) return res.status(400).json({ error: 'Invalid pipe code' });
+    const fingerprint = req.query.fingerprint;
+    if (!fingerprint) return res.status(400).json({ error: 'Missing fingerprint' });
+
+    const pipeRows = db.exec(
+      'SELECT owner_fingerprint, max_redemptions, redemption_count, closed FROM pipes WHERE pipe_code = ?',
+      [pipeCode]
+    );
+    if (pipeRows.length === 0 || pipeRows[0].values.length === 0) {
+      return res.status(404).json({ found: false });
+    }
+    const [ownerFp, cap, count, closed] = pipeRows[0].values[0];
+    if (ownerFp !== fingerprint) return res.status(403).json({ error: 'Not the pipe owner' });
+
+    const rows = db.exec(
+      'SELECT redeemer_code, owner_code, redeemer_fingerprint, redeemer_public_key, redeemer_name, created_at FROM pipe_redemptions WHERE pipe_code = ? ORDER BY created_at ASC',
+      [pipeCode]
+    );
+    const redemptions = (rows.length > 0 ? rows[0].values : []).map(r => ({
+      redeemer_code: r[0],
+      owner_code: r[1],
+      fingerprint: r[2],
+      public_key: r[3] ? JSON.parse(r[3]) : null,
+      name: r[4] || '',
+      created_at: r[5],
+    }));
+
+    res.json({ found: true, closed: !!closed, max_redemptions: cap, redemption_count: count, redemptions });
+  } catch (e) {
+    console.error('[pipe] OWNER POLL error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- POST /pipe/:code/close ---
+// Inviter closes the pipe. Redemptions already made stay valid; their
+// sessions proceed normally.
+app.post('/pipe/:code/close', (req, res) => {
+  try {
+    const pipeCode = req.params.code;
+    if (!validPipeCode(pipeCode)) return res.status(400).json({ error: 'Invalid pipe code' });
+    const { fingerprint } = req.body || {};
+    if (!fingerprint) return res.status(400).json({ error: 'Missing fingerprint' });
+
+    const pipeRows = db.exec('SELECT owner_fingerprint FROM pipes WHERE pipe_code = ?', [pipeCode]);
+    if (pipeRows.length === 0 || pipeRows[0].values.length === 0) {
+      return res.status(404).json({ found: false });
+    }
+    if (pipeRows[0].values[0][0] !== fingerprint) return res.status(403).json({ error: 'Not the pipe owner' });
+
+    db.run('UPDATE pipes SET closed = 1 WHERE pipe_code = ?', [pipeCode]);
+    saveDatabase();
+    console.log(`[pipe] Closed: ${pipeCode}`);
+    res.json({ closed: true });
+  } catch (e) {
+    console.error('[pipe] CLOSE error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // --- 404 handler ---
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
@@ -2386,4 +2659,9 @@ module.exports = {
   isSignedSelfUpdate,
   validateSignedSelfUpdateShape,
   selectAnnounceMode,
+  validPipeCode,
+  validPipeName,
+  validatePipeCreateShape,
+  validatePipeRedeemShape,
+  generateOwnerCode,
 };
