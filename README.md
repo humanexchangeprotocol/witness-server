@@ -323,6 +323,7 @@ All env vars are optional. The witness runs with reasonable defaults.
 | `HCP_PROBE_DISABLED` | (unset) | When set to `1`, skips the inbound-reachability self-check on startup. Useful when running behind a reverse proxy where the self-check cannot reach the public endpoint. |
 | `HCP_HEARTBEAT_INTERVAL_MS` | `900000` (15 min) | Override the heartbeat interval. Mainly for tests. |
 | `HCP_DEBUG` | (unset) | When set to `1`, registers a `POST /debug/heartbeat` endpoint for testing. Off in production. |
+| `HEP_SESSION_AUTOCANCEL` | (unset) | When set to `1`, an exchange session ends for both people once one of them has been silent for 60 seconds. Off by default: the witness reports presence and logs "Would cancel" lines but does not end anything on its own. |
 
 The `HCP_` prefix is historical (the project was previously named Human Credit Protocol). The variable names are retained to avoid breaking existing operator scripts.
 
@@ -347,6 +348,7 @@ The witness exposes the following HTTP endpoints. Full payload shapes are in the
 | `POST /session/:code/thread` | Push a thread snapshot to the session. |
 | `POST /session/:code/propose` | Submit a proposal in a session. |
 | `POST /session/:code/confirm` | Confirm a proposal in a session. |
+| `POST /session/:code/cancel` | End the session for both people. Nothing is recorded. |
 | `POST /announce` | Register this witness or a peer in the gossip network. Signed-mode variant carries an Ed25519 signature. |
 | `GET /peers` | List active peer witnesses. `?signed=1` returns the list inside a signed envelope. |
 | `POST /update` | Signed self-update broadcast. Used by peers to push current endpoint info. |

@@ -35,7 +35,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 
 let db = null;
 let serverKeys = null;
@@ -687,6 +687,7 @@ function runCleanup() {
   const sessionCount = expiredSessions.length > 0 ? expiredSessions[0].values.length : 0;
   db.run('DELETE FROM sessions WHERE created_at < ?', [sessionCutoff]);
   db.run('DELETE FROM session_proposals WHERE created_at < ?', [sessionCutoff]);
+  pruneSessionMemory(sessionCutoff * 1000);
   // Clean up expired invite pipes and their redemption rows (ephemeral, 24 hours max)
   const pipeCutoff = now - (PIPE_RETENTION_HOURS * 60 * 60);
   db.run('DELETE FROM pipe_redemptions WHERE created_at < ?', [pipeCutoff]);
@@ -1968,6 +1969,51 @@ function validSessionCode(code) {
   return /^[A-Z]{4}$/.test(code);
 }
 
+// --- Session presence and cancel (v2.7.0, Oct 2 rulings) ---
+// Presence is in memory only: the time each code last talked to us.
+// Every session call counts (join, poll, thread, propose, confirm,
+// cancel). A partner silent for SESSION_GONE_S is reported as not
+// present. Automatic cancel on silence is OFF unless the operator sets
+// HEP_SESSION_AUTOCANCEL=1 (observe before enforce): until then the
+// server only logs when it would have cancelled. An explicit cancel
+// (POST /session/:code/cancel) always works and ends the session for
+// both phones; a pending proposal becomes 'cancelled' so it can no
+// longer be confirmed.
+const SESSION_GONE_S = 60;
+const SESSION_AUTOCANCEL = process.env.HEP_SESSION_AUTOCANCEL === '1';
+const SESSION_START_MS = Date.now();
+const sessionSeen = new Map();       // code -> ms last seen
+const sessionCancelled = new Map();  // session key -> { by, reason, at }
+const sessionWouldCancel = new Set(); // session keys already logged
+
+function touchSession(code) { sessionSeen.set(code, Date.now()); }
+
+// seen_s is null when the partner has not talked to this server since
+// it started; they count as seen at startup so a restart cancels nobody.
+function sessionPresence(theirCode, nowMs) {
+  const t = sessionSeen.get(theirCode);
+  const age = Math.floor(((nowMs || Date.now()) - (t || SESSION_START_MS)) / 1000);
+  return { seen_s: t ? age : null, present: age < SESSION_GONE_S };
+}
+
+function validCancelReason(r) { return r === undefined || r === 'cancelled' || r === 'disconnected'; }
+
+function markSessionCancelled(sKey, byCode, reason) {
+  if (sessionCancelled.has(sKey)) return sessionCancelled.get(sKey);
+  const c = { by: byCode, reason: reason || 'cancelled', at: Date.now() };
+  sessionCancelled.set(sKey, c);
+  const now = Math.floor(Date.now() / 1000);
+  db.run("UPDATE session_proposals SET status = 'cancelled', resolved_at = ? WHERE session_key = ? AND status = 'pending'", [now, sKey]);
+  saveDatabase();
+  console.log(`[session] Cancelled: ${sKey} by ${byCode} (${c.reason})`);
+  return c;
+}
+
+function pruneSessionMemory(cutoffMs) {
+  for (const [k, t] of sessionSeen) if (t < cutoffMs) sessionSeen.delete(k);
+  for (const [k, c] of sessionCancelled) if (c.at < cutoffMs) { sessionCancelled.delete(k); sessionWouldCancel.delete(k); }
+}
+
 // --- POST /session/join ---
 // Phone joins a session with its code, partner's code, identity, and optional thread snapshot
 app.post('/session/join', (req, res) => {
@@ -1985,6 +2031,7 @@ app.post('/session/join', (req, res) => {
     }
 
     const now = Math.floor(Date.now() / 1000);
+    touchSession(my_code);
 
     // Check if already joined (idempotent)
     const existing = db.exec('SELECT my_code FROM sessions WHERE my_code = ?', [my_code]);
@@ -2047,6 +2094,7 @@ app.get('/session/:code', (req, res) => {
       return res.status(404).json({ found: false });
     }
     const theirCode = me[0].values[0][0];
+    touchSession(code);
 
     // Check if partner has joined
     const partner = db.exec(
@@ -2104,6 +2152,25 @@ app.get('/session/:code', (req, res) => {
       };
     }
 
+    // Presence and cancel (v2.7.0). Additive fields; older apps ignore them.
+    if (connected) {
+      const pres = sessionPresence(theirCode);
+      result.partner_present = pres.present;
+      result.partner_seen_s = pres.seen_s;
+      const settled = result.proposal && result.proposal.status === 'confirmed';
+      if (!pres.present && pres.seen_s !== null && !settled && !sessionCancelled.has(sKey)) {
+        if (SESSION_AUTOCANCEL) {
+          markSessionCancelled(sKey, theirCode, 'disconnected');
+          if (result.proposal && result.proposal.status === 'pending') result.proposal.status = 'cancelled';
+        } else if (!sessionWouldCancel.has(sKey)) {
+          sessionWouldCancel.add(sKey);
+          console.log(`[session] Would cancel (observe only): ${sKey}, ${theirCode} silent ${pres.seen_s}s`);
+        }
+      }
+    }
+    const cx = sessionCancelled.get(sKey);
+    if (cx) result.cancelled = { by_me: cx.by === code, reason: cx.reason };
+
     res.json(result);
   } catch (e) {
     console.error('[session] GET error:', e.message);
@@ -2128,6 +2195,7 @@ app.post('/session/:code/thread', (req, res) => {
     if (existing.length === 0 || existing[0].values.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
+    touchSession(code);
 
     if (thread_snapshot) {
       db.run('UPDATE sessions SET thread_snapshot = ? WHERE my_code = ?', [
@@ -2179,6 +2247,10 @@ app.post('/session/:code/propose', (req, res) => {
 
     const sKey = sessionKey(code, theirCode);
     const now = Math.floor(Date.now() / 1000);
+    touchSession(code);
+    if (sessionCancelled.has(sKey)) {
+      return res.status(409).json({ error: 'Session cancelled' });
+    }
 
     // Check for existing proposal
     const existing = db.exec('SELECT status FROM session_proposals WHERE session_key = ?', [sKey]);
@@ -2213,6 +2285,38 @@ app.post('/session/:code/propose', (req, res) => {
   }
 });
 
+// --- POST /session/:code/cancel ---
+// Either person ends the exchange for both (DESIGN 2b). Nothing is
+// recorded. reason is 'cancelled' (default) or 'disconnected'.
+app.post('/session/:code/cancel', (req, res) => {
+  try {
+    const { code } = req.params;
+    const reason = (req.body || {}).reason;
+    if (!validSessionCode(code)) {
+      return res.status(400).json({ error: 'Invalid code format' });
+    }
+    if (!validCancelReason(reason)) {
+      return res.status(400).json({ error: 'Invalid reason' });
+    }
+    const me = db.exec('SELECT their_code FROM sessions WHERE my_code = ?', [code]);
+    if (me.length === 0 || me[0].values.length === 0) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    const theirCode = me[0].values[0][0];
+    const sKey = sessionKey(code, theirCode);
+    touchSession(code);
+    const st = db.exec('SELECT status FROM session_proposals WHERE session_key = ?', [sKey]);
+    if (st.length > 0 && st[0].values.length > 0 && st[0].values[0][0] === 'confirmed') {
+      return res.status(409).json({ error: 'Proposal already confirmed' });
+    }
+    const c = markSessionCancelled(sKey, code, reason);
+    res.json({ cancelled: true, by_me: c.by === code, reason: c.reason });
+  } catch (e) {
+    console.error('[session] CANCEL error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // --- POST /session/:code/confirm ---
 // The other person confirms (or rejects) the proposal
 app.post('/session/:code/confirm', (req, res) => {
@@ -2234,6 +2338,7 @@ app.post('/session/:code/confirm', (req, res) => {
     }
     const theirCode = me[0].values[0][0];
     const sKey = sessionKey(code, theirCode);
+    touchSession(code);
 
     // Find proposal
     const proposal = db.exec(
@@ -2627,6 +2732,8 @@ async function start() {
     console.log(`         POST /session/:code/thread  push thread snapshot`);
     console.log(`         POST /session/:code/propose submit proposal`);
     console.log(`         POST /session/:code/confirm confirm proposal`);
+    console.log(`         POST /session/:code/cancel  end the exchange for both`);
+    console.log(`         session auto-cancel on silence: ${SESSION_AUTOCANCEL ? 'ON' : 'off (observe only)'}`);
     console.log(`         POST /announce    register a server`);
     console.log(`         GET  /peers       list active servers`);
     console.log(`         POST /update      signed self-update broadcast`);
