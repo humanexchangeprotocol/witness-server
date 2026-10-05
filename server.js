@@ -35,7 +35,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.7.0';
+const VERSION = '2.8.0';
 
 let db = null;
 let serverKeys = null;
@@ -484,6 +484,11 @@ async function initDatabase() {
 
   // Add device_ts columns for clock skew measurement (v2.2.1+)
   try { db.run('ALTER TABLE session_proposals ADD COLUMN device_ts INTEGER'); } catch(e) {}
+  // v2.8.0 countersignature (Step 0): the act hash and both signatures over it, relayed between the two phones
+  try { db.run('ALTER TABLE session_proposals ADD COLUMN act_hash TEXT'); } catch(e) {}
+  try { db.run('ALTER TABLE session_proposals ADD COLUMN proposer_act_sig TEXT'); } catch(e) {}
+  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_act_sig TEXT'); } catch(e) {}
+  try { db.run('ALTER TABLE witnessed_mints ADD COLUMN act_hash TEXT'); } catch(e) {}
   try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_device_ts INTEGER'); } catch(e) {}
   // Add device_ts to pair_halves for future clock skew on QR exchanges
   try { db.run('ALTER TABLE pair_halves ADD COLUMN device_ts INTEGER'); } catch(e) {}
@@ -756,7 +761,7 @@ app.use((req, res, next) => {
 // Phone submits a mint event for witnessing
 app.post('/witness', (req, res) => {
   try {
-    const { mint_hash, pubkey_a, pubkey_b, device_timestamp, chain_sig } = req.body;
+    const { mint_hash, pubkey_a, pubkey_b, device_timestamp, chain_sig, act_hash } = req.body;
 
     // Validate required fields
     if (!mint_hash || !pubkey_a || !pubkey_b || !device_timestamp || !chain_sig) {
@@ -793,6 +798,10 @@ app.post('/witness', (req, res) => {
       'INSERT INTO witnessed_mints (mint_hash, pubkey_a, pubkey_b, device_ts, server_ts, server_sig, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [mint_hash, pubkey_a, pubkey_b, device_timestamp, serverTimestamp, serverSignature, serverTimestamp]
     );
+    // v2.8.0: the act hash the phones folded into mint_hash, kept beside it (observe only)
+    if (act_hash && /^[a-f0-9]{64}$/i.test(act_hash)) {
+      try { db.run('UPDATE witnessed_mints SET act_hash = ? WHERE mint_hash = ?', [act_hash, mint_hash]); } catch(e) {}
+    }
 
     witnessedCount++;
     incrementCounter('mints_lifetime');
@@ -2150,6 +2159,12 @@ app.get('/session/:code', (req, res) => {
         confirmer_photo_hash: pr[21] || '',
         encrypted_exchange: pr[22] || '',
       };
+      const actRow = db.exec('SELECT act_hash, proposer_act_sig, confirmer_act_sig FROM session_proposals WHERE session_key = ?', [sKey]);
+      if (actRow.length && actRow[0].values.length) {
+        result.proposal.act_hash = actRow[0].values[0][0] || '';
+        result.proposal.proposer_act_sig = actRow[0].values[0][1] || '';
+        result.proposal.confirmer_act_sig = actRow[0].values[0][2] || '';
+      }
     }
 
     // Presence and cancel (v2.7.0). Additive fields; older apps ignore them.
@@ -2221,7 +2236,7 @@ app.post('/session/:code/thread', (req, res) => {
 app.post('/session/:code/propose', (req, res) => {
   try {
     const { code } = req.params;
-    const { value, direction, description, category, duration, device_ts, sensor_hash, platform, geo, device_hash, photo, photo_hash, encrypted_exchange } = req.body;
+    const { value, direction, description, category, duration, device_ts, sensor_hash, platform, geo, device_hash, photo, photo_hash, encrypted_exchange, act_hash, act_sig } = req.body;
 
     if (!validSessionCode(code)) {
       return res.status(400).json({ error: 'Invalid code format' });
@@ -2275,8 +2290,11 @@ app.post('/session/:code/propose', (req, res) => {
       updatePresence(fpRow[0].values[0][0], device_hash, 'session');
     }
 
+    if (act_hash || act_sig) {
+      db.run('UPDATE session_proposals SET act_hash = ?, proposer_act_sig = ? WHERE session_key = ?', [act_hash || '', act_sig || '', sKey]);
+    }
     saveDatabase();
-    console.log(`[session] Proposal submitted: ${code} in session ${sKey}`);
+    console.log(`[session] Proposal submitted: ${code} in session ${sKey}` + (act_hash ? ' (act hash)' : ''));
 
     res.json({ proposed: true, session_key: sKey });
   } catch (e) {
@@ -2322,7 +2340,7 @@ app.post('/session/:code/cancel', (req, res) => {
 app.post('/session/:code/confirm', (req, res) => {
   try {
     const { code } = req.params;
-    const { confirmed, description: confirmerDesc, device_ts: confirmerDeviceTs, sensor_hash: confirmerSensorHash, platform: confirmerPlatform, geo: confirmerGeo, device_hash: confirmerDeviceHash, photo: confirmerPhoto, photo_hash: confirmerPhotoHash } = req.body;
+    const { act_sig: confirmerActSig, confirmed, description: confirmerDesc, device_ts: confirmerDeviceTs, sensor_hash: confirmerSensorHash, platform: confirmerPlatform, geo: confirmerGeo, device_hash: confirmerDeviceHash, photo: confirmerPhoto, photo_hash: confirmerPhotoHash } = req.body;
 
     if (!validSessionCode(code)) {
       return res.status(400).json({ error: 'Invalid code format' });
@@ -2365,6 +2383,10 @@ app.post('/session/:code/confirm', (req, res) => {
       [newStatus, confirmerDesc || '', confirmerDeviceTs || null, confirmerSensorHash || '', confirmerPlatform || '', confirmerGeo || '', confirmerDeviceHash || '', confirmerPhoto || '', confirmerPhotoHash || '', now, sKey]
     );
 
+    if (confirmed && confirmerActSig) {
+      db.run('UPDATE session_proposals SET confirmer_act_sig = ? WHERE session_key = ?', [confirmerActSig, sKey]);
+    }
+
     // Update presence
     const fpRow = db.exec('SELECT fingerprint FROM sessions WHERE my_code = ?', [code]);
     if (fpRow.length > 0 && fpRow[0].values.length > 0) {
@@ -2388,6 +2410,9 @@ app.post('/session/:code/confirm', (req, res) => {
 
     const proposerData = proposer[0].values[0];
     const confirmerData = confirmer[0].values[0];
+    const actRow = db.exec('SELECT act_hash, proposer_act_sig FROM session_proposals WHERE session_key = ?', [sKey]);
+    const actHash = (actRow.length && actRow[0].values.length) ? (actRow[0].values[0][0] || '') : '';
+    const proposerActSig = (actRow.length && actRow[0].values.length) ? (actRow[0].values[0][1] || '') : '';
 
     res.json({
       confirmed: true,
@@ -2403,11 +2428,15 @@ app.post('/session/:code/confirm', (req, res) => {
         platform: pr[9] || '',
         geo: pr[10] || '',
         encrypted_exchange: pr[14] || '',
+        act_hash: actHash,
+        proposer_act_sig: proposerActSig,
+        confirmer_act_sig: confirmerActSig || '',
       },
       proposer: {
         code: theirCode,
         fingerprint: proposerData[0],
         public_key: JSON.parse(proposerData[1]),
+        act_sig: proposerActSig,
         device_hash: pr[11] || '',
         photo: pr[12] || '',
         photo_hash: pr[13] || '',
