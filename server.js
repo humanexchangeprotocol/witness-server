@@ -35,7 +35,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.8.0';
+const VERSION = '2.9.0';
 
 let db = null;
 let serverKeys = null;
@@ -2249,15 +2249,23 @@ app.post('/session/:code/propose', (req, res) => {
     }
 
     // Verify session exists and is connected
-    const me = db.exec('SELECT their_code FROM sessions WHERE my_code = ?', [code]);
+    const me = db.exec('SELECT their_code, fingerprint FROM sessions WHERE my_code = ?', [code]);
     if (me.length === 0 || me[0].values.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
     const theirCode = me[0].values[0][0];
+    const myFp = me[0].values[0][1];
 
-    const partner = db.exec('SELECT my_code FROM sessions WHERE my_code = ? AND their_code = ?', [theirCode, code]);
+    const partner = db.exec('SELECT my_code, fingerprint FROM sessions WHERE my_code = ? AND their_code = ?', [theirCode, code]);
     if (partner.length === 0 || partner[0].values.length === 0) {
       return res.status(409).json({ error: 'Session not yet connected. Partner has not joined' });
+    }
+    // Same-owner rule (v2.9.0, protocol): a chain cannot exchange with itself.
+    // The witness sees root fingerprints only (the parent key travels inside
+    // the encrypted snapshot), so it enforces the same-root half of the rule.
+    if (myFp && partner[0].values[0][1] && myFp === partner[0].values[0][1]) {
+      console.log(`[session] Refused proposal ${code}: both sides are the same chain`);
+      return res.status(409).json({ error: 'same_chain', reason: 'A chain cannot exchange with itself' });
     }
 
     const sKey = sessionKey(code, theirCode);
@@ -2575,6 +2583,10 @@ app.post('/pipe/:code/redeem', (req, res) => {
       return res.status(404).json({ accepted: false, reason: 'not_found' });
     }
     const [ownerFp, ownerKey, ownerName, cap, count, closed, createdAt] = pipeRows[0].values[0];
+    // Same-owner rule (v2.9.0): redeeming a pipe your own chain opened.
+    if (ownerFp && fingerprint === ownerFp) {
+      return res.json({ accepted: false, reason: 'same_chain' });
+    }
 
     const now = Math.floor(Date.now() / 1000);
     if (now - createdAt > PIPE_RETENTION_HOURS * 60 * 60) {
