@@ -342,7 +342,8 @@ The witness exposes the following HTTP endpoints. Full payload shapes are in the
 | `POST /ping` | Heartbeat attestation. Signs the hash of the chain's latest record in; stores nothing. |
 | `PUT /relay/:id` | Deposit a settlement payload for a counterparty to retrieve. |
 | `GET /relay/:id` | Retrieve a deposited settlement. |
-| `POST /session/join` | Join an exchange session by code. |
+| `POST /session/join` | Join an exchange session by code, with a fresh session key or (since 2.12.0) a commitment to one. |
+| `POST /session/reveal` | Reveal the session key behind a commitment, accepted only once the other side has joined. |
 | `GET /session/:code` | Poll session state. |
 | `POST /session/:code/thread` | Push a sealed snapshot to the session. Plaintext is refused. |
 | `POST /session/:code/propose` | Submit a sealed proposal. An unsealed one is refused. |
@@ -357,7 +358,7 @@ The signed-mode endpoints (`POST /announce` signed variant, `GET /peers?signed=1
 
 ## What a witness holds
 
-A witness is a notary of two sealed packets. Anyone can run one, so the design assumes a hostile operator and gives it nothing about the people using it. Every endpoint has an allowlist of the fields it accepts; anything else is dropped before it reaches a row or a log. What a witness may hold in clear is fixed: session codes, chain fingerprints, public keys, the act hash and signatures, the encrypted packets, and timestamps. Sessions are kept two hours, invite pipes 24 hours, witnessed mint hashes six hours, ping challenges 60 seconds. There is no presence lookup, no ping log and no activity statistics.
+A witness is a notary of two sealed packets. Anyone can run one, so the design assumes a hostile operator and gives it nothing about the people using it. Every endpoint has an allowlist of the fields it accepts; anything else is dropped before it reaches a row or a log. What a witness may hold in clear is fixed: session codes, chain fingerprints, public keys (including per-session keys and a hash commitment to one), the act hash and signatures, the encrypted packets, and timestamps. Sessions are kept two hours, invite pipes 24 hours, witnessed mint hashes six hours, ping challenges 60 seconds. There is no presence lookup, no ping log and no activity statistics.
 
 Upgrading from 2.9.0 or earlier rebuilds the database on first start: readable fields an older version kept are removed and the file is compacted. Any backup taken before the upgrade still holds those fields; delete it once the new version checks out.
 

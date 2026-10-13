@@ -110,7 +110,7 @@ async function main() {
   const st = await (await fetch(BASE + '/status')).json();
   check('/status has no witnessed_total', st.witnessed_total === undefined);
   check('/status has no active_sessions', st.active_sessions === undefined);
-  check('/status keeps pubkey and version', typeof st.server_pubkey === 'string' && st.version === '2.11.0');
+  check('/status keeps pubkey and version', typeof st.server_pubkey === 'string' && st.version === '2.12.0');
   const pubkey = Buffer.from(st.server_pubkey, 'hex');
 
   console.log('\n3. Sealed session with extra clear fields');
@@ -186,6 +186,27 @@ async function main() {
   check('unknown code answers like an open one (no oracle)', r.status === 200 && j.found === true && j.connected === false);
   r = await post('/session/join', { my_code: 'KLMN', their_code: 'PQRS', fingerprint: 'fpA', public_key: kA, session_key: { x: 5 }, session_sig: 'sigA' });
   check('malformed session key refused', r.status === 400);
+
+  console.log('\n5c. v2.12.0: commitment on join, reveal once both are in');
+  const cA = 'a'.repeat(64), cB = 'b'.repeat(64);
+  r = await post('/session/join', { my_code: 'CDEF', their_code: 'GHJK', fingerprint: 'fpA', public_key: kA, session_commit: 'nothex' });
+  check('malformed commitment refused', r.status === 400);
+  r = await post('/session/reveal', { my_code: 'CDEF', session_key: skA, session_sig: 'sigA' }); j = await r.json();
+  check('reveal on an unknown code answers waiting (no oracle)', r.status === 200 && j.revealed === false && j.waiting === true);
+  r = await post('/session/join', { my_code: 'CDEF', their_code: 'GHJK', fingerprint: 'fpA', public_key: kA, session_commit: cA });
+  check('join with a commitment and no key accepted', r.status === 200);
+  r = await post('/session/reveal', { my_code: 'CDEF', session_key: skA, session_sig: 'sigA' }); j = await r.json();
+  check('reveal before the partner joined refused as waiting', j.revealed === false && j.waiting === true);
+  r = await post('/session/join', { my_code: 'GHJK', their_code: 'CDEF', fingerprint: 'fpB', public_key: kB, session_commit: cB }); j = await r.json();
+  check('second join connects and the partner view carries the commitment, not a key', j.connected === true && j.partner.session_commit === cA && j.partner.session_key === null);
+  r = await post('/session/reveal', { my_code: 'CDEF', session_key: skA, session_sig: 'sigA' }); j = await r.json();
+  check('reveal after both joined accepted', j.revealed === true);
+  r = await post('/session/reveal', { my_code: 'CDEF', session_key: skB, session_sig: 'sigB' });
+  r = await fetch(BASE + '/session/GHJK'); j = await r.json();
+  check('a second reveal cannot replace the first key', j.partner.session_key.x === skA.x && j.partner.session_sig === 'sigA');
+  check('partner view after reveal carries key, signature and commitment', j.partner.session_commit === cA && j.partner.session_key.x === skA.x);
+  r = await post('/session/reveal', { my_code: 'KLMN', session_key: skA, session_sig: 'sigA' });
+  check('reveal on a session joined without a commitment refused', r.status === 400);
   let limited = false;
   for (let i = 0; i < 70; i++) { const c = 'R' + String.fromCharCode(65 + (i % 26)) + String.fromCharCode(65 + Math.floor(i / 26)) + 'T'; const rr = await post('/session/join', { my_code: c, their_code: 'ZZZA', fingerprint: 'fpX', public_key: kA }); if (rr.status === 429) { limited = true; break; } }
   check('joins rate limited per address', limited);

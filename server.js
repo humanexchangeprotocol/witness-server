@@ -36,7 +36,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.11.0';
+const VERSION = '2.12.0';
 
 let db = null;
 let serverKeys = null;
@@ -412,6 +412,7 @@ async function initDatabase() {
   // key (public material, already on the allowlist as keys and signatures).
   try { db.run('ALTER TABLE sessions ADD COLUMN session_key TEXT'); } catch(e) {}
   try { db.run('ALTER TABLE sessions ADD COLUMN session_sig TEXT'); } catch(e) {}
+  try { db.run('ALTER TABLE sessions ADD COLUMN session_commit TEXT'); } catch(e) {} // v2.12.0: the mark
 
   db.run(`
     CREATE TABLE IF NOT EXISTS session_proposals (
@@ -517,7 +518,7 @@ function saveDatabase() {
 // removed values do not linger in free pages of the database file.
 const MINIMAL_COLUMNS = {
   witnessed_mints: ['mint_hash', 'device_ts', 'server_ts', 'server_sig', 'act_hash', 'created_at'],
-  sessions: ['my_code', 'their_code', 'fingerprint', 'public_key', 'encrypted_snapshot', 'created_at', 'session_key', 'session_sig'],
+  sessions: ['my_code', 'their_code', 'fingerprint', 'public_key', 'encrypted_snapshot', 'created_at', 'session_key', 'session_sig', 'session_commit'],
   session_proposals: ['session_key', 'proposer_code', 'status', 'encrypted_exchange', 'act_hash', 'proposer_act_sig', 'confirmer_act_sig', 'device_ts', 'confirmer_device_ts', 'created_at', 'resolved_at'],
   pipes: ['pipe_code', 'owner_fingerprint', 'owner_public_key', 'max_redemptions', 'redemption_count', 'closed', 'created_at'],
   pipe_redemptions: ['pipe_code', 'redeemer_code', 'owner_code', 'redeemer_fingerprint', 'redeemer_public_key', 'created_at'],
@@ -1624,9 +1625,16 @@ function partnerView(row) {
     encrypted_snapshot: row[2] || null,
     session_key: row[3] ? JSON.parse(row[3]) : null,
     session_sig: row[4] || null,
+    session_commit: row[5] || null,
   };
 }
-const PARTNER_COLS = 'fingerprint, public_key, encrypted_snapshot, session_key, session_sig';
+const PARTNER_COLS = 'fingerprint, public_key, encrypted_snapshot, session_key, session_sig, session_commit';
+// v2.12.0: the mark (outside scrutiny finding 1, batch three). A phone may join with a
+// commitment (a hash of its session key) instead of the key, and reveal the key only once
+// the other side has joined too. Both are public key material on the allowlist; the
+// witness checks shape only and keeps nothing else.
+function validCommit(c) { return typeof c === 'string' && /^[0-9a-f]{64}$/.test(c); }
+function validSessionKeyShape(k) { return k && typeof k === 'object' && typeof k.x === 'string' && typeof k.y === 'string' && k.x.length <= 64 && k.y.length <= 64; }
 
 // v2.11.0: joins are rate limited per address, in memory only, nothing written
 // or logged. A 4-letter code has 456,976 values; this makes guessing one an
@@ -1652,9 +1660,9 @@ function joinAllowed(req) {
 // Phone joins a session with its code, its partner's code and its key.
 // v2.10.0: no plaintext snapshot and no role on the join; anything the
 // other phone needs travels in the encrypted snapshot.
-app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public_key', 'session_key', 'session_sig']), (req, res) => {
+app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public_key', 'session_key', 'session_sig', 'session_commit']), (req, res) => {
   try {
-    const { my_code, their_code, fingerprint, public_key, session_key, session_sig } = req.body;
+    const { my_code, their_code, fingerprint, public_key, session_key, session_sig, session_commit } = req.body;
 
     if (!my_code || !their_code || !fingerprint || !public_key) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -1665,6 +1673,9 @@ app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public
     }
     if (session_sig && (typeof session_sig !== 'string' || session_sig.length > 256)) {
       return res.status(400).json({ error: 'Invalid session signature' });
+    }
+    if (session_commit && !validCommit(session_commit)) {
+      return res.status(400).json({ error: 'Invalid session commitment' });
     }
     if (!validSessionCode(my_code) || !validSessionCode(their_code)) {
       return res.status(400).json({ error: 'Invalid code format' });
@@ -1679,8 +1690,8 @@ app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public
     const existing = db.exec('SELECT my_code FROM sessions WHERE my_code = ?', [my_code]);
     if (existing.length === 0 || existing[0].values.length === 0) {
       db.run(
-        'INSERT INTO sessions (my_code, their_code, fingerprint, public_key, created_at, session_key, session_sig) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [my_code, their_code, fingerprint, JSON.stringify(public_key), now, session_key ? JSON.stringify({ kty: session_key.kty || 'EC', crv: session_key.crv || 'P-256', x: session_key.x, y: session_key.y }) : null, session_sig || null]
+        'INSERT INTO sessions (my_code, their_code, fingerprint, public_key, created_at, session_key, session_sig, session_commit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [my_code, their_code, fingerprint, JSON.stringify(public_key), now, session_key ? JSON.stringify({ kty: session_key.kty || 'EC', crv: session_key.crv || 'P-256', x: session_key.x, y: session_key.y }) : null, session_sig || null, session_commit || null]
       );
       console.log(`[session] Joined: ${my_code} -> ${their_code}`);
       saveDatabase();
@@ -1697,6 +1708,36 @@ app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public
     res.json({ joined: true, connected: false });
   } catch (e) {
     console.error('[session] JOIN error:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- POST /session/reveal ---
+// v2.12.0: the key behind a commitment, once both sides have joined. Refused before the
+// partner's row exists (so neither phone can be made to reveal first) and after a key is
+// already on the row (a commitment is kept once). The phones check hash(key) against
+// the commitment themselves; the witness only carries it.
+app.post('/session/reveal', allow(['my_code', 'session_key', 'session_sig']), (req, res) => {
+  try {
+    const { my_code, session_key, session_sig } = req.body;
+    if (!validSessionCode(my_code) || !validSessionKeyShape(session_key) || typeof session_sig !== 'string' || session_sig.length > 256) {
+      return res.status(400).json({ error: 'Invalid reveal' });
+    }
+    const me = db.exec('SELECT their_code, session_commit, session_key FROM sessions WHERE my_code = ?', [my_code]);
+    if (me.length === 0 || me[0].values.length === 0) return res.json({ revealed: false, waiting: true });
+    const [theirCode, commit, existingKey] = me[0].values[0];
+    if (!commit) return res.status(400).json({ error: 'No commitment on this session' });
+    if (existingKey) return res.json({ revealed: true });
+    const partner = db.exec('SELECT my_code FROM sessions WHERE my_code = ? AND their_code = ?', [theirCode, my_code]);
+    if (partner.length === 0 || partner[0].values.length === 0) return res.json({ revealed: false, waiting: true });
+    db.run('UPDATE sessions SET session_key = ?, session_sig = ? WHERE my_code = ?',
+      [JSON.stringify({ kty: session_key.kty || 'EC', crv: session_key.crv || 'P-256', x: session_key.x, y: session_key.y }), session_sig, my_code]);
+    touchSession(my_code);
+    saveDatabase();
+    console.log(`[session] Revealed: ${my_code}`);
+    res.json({ revealed: true });
+  } catch (e) {
+    console.error('[session] REVEAL error:', e.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
