@@ -40,7 +40,7 @@ Confirm the server is responding:
 curl http://localhost:3141/status
 ```
 
-You should see a JSON response with `version`, `witnessed_total`, uptime, and a `server_pubkey` field. The `server_pubkey` is the 64-character hex form of the witness's public key. This identifier never changes for the life of this `server_key.json` file.
+You should see a JSON response with `version`, uptime, peer count, and a `server_pubkey` field. The `server_pubkey` is the 64-character hex form of the witness's public key. This identifier never changes for the life of this `server_key.json` file.
 
 ---
 
@@ -335,27 +335,31 @@ The witness exposes the following HTTP endpoints. Full payload shapes are in the
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | Health check. Returns version, pubkey, uptime, witnessed-mint count. |
-| `GET /stats` | Public aggregate counters. Daily-grain only, no identifiers. |
-| `POST /witness` | Submit a cooperative-act mint for attestation. |
-| `POST /ping` | Proof-of-human heartbeat attestation. |
+| `GET /status` | Health check. Returns version, pubkey, uptime, peer count and retention. No activity counts. |
+| `GET /stats` | Version, uptime and peer count. No activity counts. |
+| `POST /witness` | Attest a mint hash. Kept six hours so a retry gets the same answer. |
+| `POST /ping/challenge` | Get a 60-second challenge for a ping. |
+| `POST /ping` | Heartbeat attestation. Signs the hash of the chain's latest record in; stores nothing. |
 | `PUT /relay/:id` | Deposit a settlement payload for a counterparty to retrieve. |
 | `GET /relay/:id` | Retrieve a deposited settlement. |
-| `POST /pair` | Submit a pairing-code half. |
-| `GET /pair/check/:code` | Poll pairing-code resolution. |
 | `POST /session/join` | Join an exchange session by code. |
 | `GET /session/:code` | Poll session state. |
-| `POST /session/:code/thread` | Push a thread snapshot to the session. |
-| `POST /session/:code/propose` | Submit a proposal in a session. |
+| `POST /session/:code/thread` | Push a sealed snapshot to the session. Plaintext is refused. |
+| `POST /session/:code/propose` | Submit a sealed proposal. An unsealed one is refused. |
 | `POST /session/:code/confirm` | Confirm a proposal in a session. |
 | `POST /session/:code/cancel` | End the session for both people. Nothing is recorded. |
+| `POST /pipe`, `POST /pipe/:code/redeem`, `POST /pipe/:code/owner`, `POST /pipe/:code/close` | Invite pipes: introduce two session codes through a QR. No names. |
 | `POST /announce` | Register this witness or a peer in the gossip network. Signed-mode variant carries an Ed25519 signature. |
 | `GET /peers` | List active peer witnesses. `?signed=1` returns the list inside a signed envelope. |
 | `POST /update` | Signed self-update broadcast. Used by peers to push current endpoint info. |
 
 The signed-mode endpoints (`POST /announce` signed variant, `GET /peers?signed=1`, `POST /update`) are part of the cryptographic-identity protocol. Clients verify the returned signatures against pubkeys they already trust.
 
-The witness never exposes raw chain content, message contents, or counterparty identities. Everything the witness sees is hashed before reaching the wire.
+## What a witness holds
+
+A witness is a notary of two sealed packets. Anyone can run one, so the design assumes a hostile operator and gives it nothing about the people using it. Every endpoint has an allowlist of the fields it accepts; anything else is dropped before it reaches a row or a log. What a witness may hold in clear is fixed: session codes, chain fingerprints, public keys, the act hash and signatures, the encrypted packets, and timestamps. Sessions are kept two hours, invite pipes 24 hours, witnessed mint hashes six hours, ping challenges 60 seconds. There is no presence lookup, no ping log and no activity statistics.
+
+Upgrading from 2.9.0 or earlier rebuilds the database on first start: readable fields an older version kept are removed and the file is compacted. Any backup taken before the upgrade still holds those fields; delete it once the new version checks out.
 
 ---
 

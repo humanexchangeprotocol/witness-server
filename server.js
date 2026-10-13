@@ -19,10 +19,10 @@ const PORT = process.env.HCP_PORT || 3141;
 const DB_PATH = process.env.HCP_DB || path.join(__dirname, 'witness.db');
 const KEY_PATH = process.env.HCP_KEY || path.join(__dirname, 'server_key.json');
 const STATE_PATH = process.env.HCP_STATE || path.join(__dirname, 'server_state.json');
-const MINT_RETENTION_DAYS = 30;
+// v2.10.0 minimization: a witness keeps what it holds for hours, not days.
+const MINT_RETENTION_HOURS = 6; // idempotent re-witness window only
 const RELAY_RETENTION_HOURS = 72;
-const PAIR_RETENTION_DAYS = 7;
-const SESSION_RETENTION_HOURS = 24; // Sessions are ephemeral, 24 hour max
+const SESSION_RETENTION_HOURS = 2; // v2.10.0: sessions are ephemeral, two hours max
 const PIPE_RETENTION_HOURS = 24; // Invite pipes are ephemeral, 24 hour max (matches sessions)
 const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -35,14 +35,12 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.9.0';
+const VERSION = '2.10.0';
 
 let db = null;
 let serverKeys = null;
 let serverState = null;
 let startTime = Date.now();
-let witnessedCount = 0;
-let pohPingCount = 0;
 
 // === ED25519 KEY MANAGEMENT ===
 
@@ -357,15 +355,22 @@ async function initDatabase() {
     console.log('[db] Created new database');
   }
 
-  // Create tables
+  // === v2.10.0 MINIMIZATION (Oct 13 rulings) ===
+  // The witness is a notary of two sealed packets. Person-facing tables
+  // hold only the allowlist: codes, fingerprints, public keys, act hash
+  // and signatures, encrypted blobs, timestamps. Older databases are
+  // migrated in place: tables whose shape held anything more are rebuilt
+  // with the allowed columns only, and tables that should not exist are
+  // dropped. Run once at boot; idempotent.
+  migrateToMinimal();
+
   db.run(`
     CREATE TABLE IF NOT EXISTS witnessed_mints (
       mint_hash TEXT PRIMARY KEY,
-      pubkey_a TEXT NOT NULL,
-      pubkey_b TEXT NOT NULL,
       device_ts INTEGER NOT NULL,
       server_ts INTEGER NOT NULL,
       server_sig TEXT NOT NULL,
+      act_hash TEXT,
       created_at INTEGER NOT NULL
     )
   `);
@@ -389,35 +394,14 @@ async function initDatabase() {
     )
   `);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS pair_halves (
-      my_code TEXT PRIMARY KEY,
-      their_code TEXT NOT NULL,
-      value REAL NOT NULL,
-      direction TEXT NOT NULL,
-      description TEXT,
-      category TEXT,
-      duration INTEGER DEFAULT 0,
-      fingerprint TEXT NOT NULL,
-      public_key TEXT NOT NULL,
-      timestamp TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      resolved INTEGER DEFAULT 0,
-      resolve_status TEXT,
-      counterparty_fp TEXT,
-      counterparty_key TEXT,
-      counterparty_desc TEXT
-    )
-  `);
-
-  // Session tables. Ephemeral pipe for thread sharing + single-sided proposals
+  // Session tables. Ephemeral rendezvous: codes, keys, sealed packets.
   db.run(`
     CREATE TABLE IF NOT EXISTS sessions (
       my_code TEXT PRIMARY KEY,
       their_code TEXT NOT NULL,
       fingerprint TEXT NOT NULL,
       public_key TEXT NOT NULL,
-      thread_snapshot TEXT,
+      encrypted_snapshot TEXT,
       created_at INTEGER NOT NULL
     )
   `);
@@ -426,13 +410,13 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS session_proposals (
       session_key TEXT PRIMARY KEY,
       proposer_code TEXT NOT NULL,
-      value REAL NOT NULL,
-      direction TEXT NOT NULL,
-      description TEXT,
-      category TEXT,
-      duration INTEGER DEFAULT 0,
       status TEXT DEFAULT 'pending',
-      confirmer_desc TEXT,
+      encrypted_exchange TEXT NOT NULL,
+      act_hash TEXT,
+      proposer_act_sig TEXT,
+      confirmer_act_sig TEXT,
+      device_ts INTEGER,
+      confirmer_device_ts INTEGER,
       created_at INTEGER NOT NULL,
       resolved_at INTEGER
     )
@@ -442,16 +426,12 @@ async function initDatabase() {
   // A pipe is a temporary rendezvous reference carried in a QR code.
   // Redemption introduces session codes to both sides; the existing
   // session machinery then runs unchanged. The pipe never carries an
-  // exchange: the mint always requires both phones' signatures, made
-  // through the normal session flow after introduction.
-  // max_redemptions: 1 = single invite (first redemption claims the
-  // pipe), 0 = uncapped room mode (open until closed or expired).
+  // exchange or a name. max_redemptions: 1 = single invite, 0 = room.
   db.run(`
     CREATE TABLE IF NOT EXISTS pipes (
       pipe_code TEXT PRIMARY KEY,
       owner_fingerprint TEXT NOT NULL,
       owner_public_key TEXT NOT NULL,
-      owner_name TEXT,
       max_redemptions INTEGER NOT NULL DEFAULT 1,
       redemption_count INTEGER NOT NULL DEFAULT 0,
       closed INTEGER NOT NULL DEFAULT 0,
@@ -466,58 +446,12 @@ async function initDatabase() {
       owner_code TEXT NOT NULL,
       redeemer_fingerprint TEXT NOT NULL,
       redeemer_public_key TEXT NOT NULL,
-      redeemer_name TEXT,
       created_at INTEGER NOT NULL,
       PRIMARY KEY (pipe_code, redeemer_code)
     )
   `);
 
-  // Create indexes for cleanup queries
-  db.run('CREATE INDEX IF NOT EXISTS idx_mints_created ON witnessed_mints(created_at)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_relay_created ON settlement_relay(created_at)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_peers_heartbeat ON peers(last_heartbeat)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_pairs_created ON pair_halves(created_at)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_pairs_their_code ON pair_halves(their_code)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_their ON sessions(their_code)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_session_proposals_created ON session_proposals(created_at)');
-
-  // Add device_ts columns for clock skew measurement (v2.2.1+)
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN device_ts INTEGER'); } catch(e) {}
-  // v2.8.0 countersignature (Step 0): the act hash and both signatures over it, relayed between the two phones
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN act_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN proposer_act_sig TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_act_sig TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE witnessed_mints ADD COLUMN act_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_device_ts INTEGER'); } catch(e) {}
-  // Add device_ts to pair_halves for future clock skew on QR exchanges
-  try { db.run('ALTER TABLE pair_halves ADD COLUMN device_ts INTEGER'); } catch(e) {}
-
-  // Cross-device sensor hash for proof-of-human (v2.2.2+)
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN sensor_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN platform TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_sensor_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_platform TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN geo TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_geo TEXT'); } catch(e) {}
-
-  // Proof-of-Human ping table (v2.2.2+)
-  db.run(`
-    CREATE TABLE IF NOT EXISTS poh_pings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chain_fingerprint TEXT NOT NULL,
-      sensor_hash TEXT,
-      device_ts INTEGER NOT NULL,
-      server_ts INTEGER NOT NULL,
-      server_sig TEXT NOT NULL,
-      seq INTEGER,
-      created_at INTEGER NOT NULL
-    )
-  `);
-  db.run('CREATE INDEX IF NOT EXISTS idx_poh_pings_chain ON poh_pings(chain_fingerprint)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_poh_pings_created ON poh_pings(created_at)');
-
-  // Ping challenge-response table (v2.3.0+)
+  // Ping challenges: the only thing a ping leaves behind, for 60 seconds.
   db.run(`
     CREATE TABLE IF NOT EXISTS ping_challenges (
       nonce TEXT PRIMARY KEY,
@@ -526,33 +460,13 @@ async function initDatabase() {
     )
   `);
 
-  // Presence registry (v2.3.0+)
-  db.run(`
-    CREATE TABLE IF NOT EXISTS presence_registry (
-      chain_fingerprint TEXT PRIMARY KEY,
-      first_seen INTEGER NOT NULL,
-      last_seen INTEGER NOT NULL,
-      attested_ping_count INTEGER DEFAULT 0,
-      witnessed_exchange_count INTEGER DEFAULT 0,
-      last_device_hash TEXT
-    )
-  `);
-
-  // Device hash relay for session and pair exchanges (v2.3.0+)
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN device_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_device_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE pair_halves ADD COLUMN device_hash TEXT'); } catch(e) {}
-
-  // Photo relay for session exchanges (v2.3.0+)
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN proposer_photo TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_photo TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN proposer_photo_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN confirmer_photo_hash TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE session_proposals ADD COLUMN encrypted_exchange TEXT'); } catch(e) {}
-
-  // Option B: encrypted snapshot + role for session privacy
-  try { db.run('ALTER TABLE sessions ADD COLUMN encrypted_snapshot TEXT'); } catch(e) {}
-  try { db.run('ALTER TABLE sessions ADD COLUMN role TEXT'); } catch(e) {}
+  db.run('CREATE INDEX IF NOT EXISTS idx_mints_created ON witnessed_mints(created_at)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_relay_created ON settlement_relay(created_at)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_peers_heartbeat ON peers(last_heartbeat)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_their ON sessions(their_code)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_session_proposals_created ON session_proposals(created_at)');
+  finishMigration();
 
   // Witness identity protocol Phase A, slice 4: signed-format peer columns.
   // Additive nullable migration. Existing url-keyed rows continue functioning
@@ -574,42 +488,8 @@ async function initDatabase() {
   // the async probe. Filtered to reachable=1 in getActivePeersSigned.
   try { db.run('ALTER TABLE peers ADD COLUMN reachable INTEGER'); } catch(e) {}
 
-  // Slice 9: persistent counters for /stats lifetime aggregates.
-  // Lifetime counts must survive process restart and table cleanup
-  // (witnessed_mints rows older than MINT_RETENTION_DAYS are deleted;
-  // poh_pings similarly). The counters table holds monotonically
-  // increasing values that persist across both. Counters are
-  // bootstrapped from existing data on first boot below.
-  db.run(`
-    CREATE TABLE IF NOT EXISTS counters (
-      key TEXT PRIMARY KEY,
-      value INTEGER NOT NULL DEFAULT 0
-    )
-  `);
-
-  // Load lifetime witness count
-  const row = db.exec('SELECT COUNT(*) as c FROM witnessed_mints');
-  witnessedCount = row.length > 0 ? row[0].values[0][0] : 0;
-  // Also count any previously deleted (track via a counter file)
-  if (fs.existsSync(path.join(__dirname, 'witness_count.txt'))) {
-    witnessedCount += parseInt(fs.readFileSync(path.join(__dirname, 'witness_count.txt'), 'utf8')) || 0;
-  }
-
-  // Load ping count
-  const pingRow = db.exec('SELECT COUNT(*) as c FROM poh_pings');
-  pohPingCount = pingRow.length > 0 ? pingRow[0].values[0][0] : 0;
-
-  // Slice 9: bootstrap counters table from in-memory totals if not
-  // already populated. After bootstrap, every new mint/ping bumps
-  // the counter alongside the in-memory variable, so the two stay
-  // in sync. The counter is what survives /stats reads after a
-  // restart; the in-memory variable is what /status uses for
-  // backwards compatibility.
-  bootstrapCounter('mints_lifetime', witnessedCount);
-  bootstrapCounter('pings_lifetime', pohPingCount);
-
   saveDatabase();
-  console.log('[db] Tables ready. Witnessed mints in DB:', row.length > 0 ? row[0].values[0][0] : 0);
+  console.log('[db] Tables ready (minimal shapes, v2.10.0)');
 }
 
 function saveDatabase() {
@@ -622,47 +502,71 @@ function saveDatabase() {
   }
 }
 
-// === PERSISTENT COUNTERS (slice 9) ===
-// Lifetime aggregate counts that survive process restart and table
-// cleanup. Backed by the counters table (key TEXT PRIMARY KEY,
-// value INTEGER). Accessed only at /stats read time and at write
-// points (mint accept, ping accept). Bootstrap (initDatabase below)
-// seeds them from the existing in-memory totals on first boot.
+// === MIGRATION TO MINIMAL SHAPES (v2.10.0) ===
+// Keeps only allowlisted columns. A table is rebuilt when it carries any
+// column outside its allowed set; rows keep their allowed values. Tables
+// that should not exist (pair halves, ping log, presence registry,
+// aggregate counters) are dropped outright. VACUUM afterwards so the
+// removed values do not linger in free pages of the database file.
+const MINIMAL_COLUMNS = {
+  witnessed_mints: ['mint_hash', 'device_ts', 'server_ts', 'server_sig', 'act_hash', 'created_at'],
+  sessions: ['my_code', 'their_code', 'fingerprint', 'public_key', 'encrypted_snapshot', 'created_at'],
+  session_proposals: ['session_key', 'proposer_code', 'status', 'encrypted_exchange', 'act_hash', 'proposer_act_sig', 'confirmer_act_sig', 'device_ts', 'confirmer_device_ts', 'created_at', 'resolved_at'],
+  pipes: ['pipe_code', 'owner_fingerprint', 'owner_public_key', 'max_redemptions', 'redemption_count', 'closed', 'created_at'],
+  pipe_redemptions: ['pipe_code', 'redeemer_code', 'owner_code', 'redeemer_fingerprint', 'redeemer_public_key', 'created_at'],
+};
+const DROPPED_TABLES = ['pair_halves', 'poh_pings', 'presence_registry', 'counters'];
 
-function getCounter(key) {
-  try {
-    const r = db.exec('SELECT value FROM counters WHERE key = ?', [key]);
-    if (r.length > 0 && r[0].values.length > 0) {
-      return r[0].values[0][0];
-    }
-  } catch (e) {
-    console.error('[counters] read error:', e.message);
-  }
-  return 0;
+function tableColumns(name) {
+  const r = db.exec(`PRAGMA table_info(${name})`);
+  return r.length > 0 ? r[0].values.map(v => v[1]) : [];
 }
 
-function incrementCounter(key) {
-  try {
-    db.run(
-      'INSERT INTO counters (key, value) VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET value = value + 1',
-      [key]
-    );
-  } catch (e) {
-    console.error('[counters] increment error:', e.message);
-  }
-}
-
-// bootstrapCounter sets a counter to `seed` only if no row exists yet
-// for `key`. Used at boot to migrate existing in-memory totals into
-// the persistent table without overwriting subsequent increments.
-function bootstrapCounter(key, seed) {
-  try {
-    const r = db.exec('SELECT 1 FROM counters WHERE key = ?', [key]);
-    if (r.length === 0 || r[0].values.length === 0) {
-      db.run('INSERT INTO counters (key, value) VALUES (?, ?)', [key, Number.isInteger(seed) ? seed : 0]);
+function migrateToMinimal() {
+  let changed = false;
+  for (const t of DROPPED_TABLES) {
+    if (tableColumns(t).length > 0) {
+      db.run(`DROP TABLE ${t}`);
+      console.log(`[migrate] Dropped table ${t}`);
+      changed = true;
     }
-  } catch (e) {
-    console.error('[counters] bootstrap error:', e.message);
+  }
+  for (const [t, allowed] of Object.entries(MINIMAL_COLUMNS)) {
+    const cols = tableColumns(t);
+    if (cols.length === 0) continue; // fresh database: created below
+    const extra = cols.filter(c => !allowed.includes(c));
+    if (extra.length === 0) continue;
+    const keep = allowed.filter(c => cols.includes(c));
+    db.run(`ALTER TABLE ${t} RENAME TO ${t}_old`);
+    changed = true;
+    console.log(`[migrate] Rebuilding ${t}: removing ${extra.join(', ')}`);
+    // initDatabase creates the minimal shape next; finishMigration then
+    // copies the allowed columns across and drops the old table.
+    pendingCopies.push({ t, keep });
+  }
+  migrationChanged = changed;
+}
+let pendingCopies = [];
+let migrationChanged = false;
+
+function finishMigration() {
+  for (const { t, keep } of pendingCopies) {
+    const list = keep.join(', ');
+    let where = '';
+    // A proposal without a sealed packet cannot be carried forward.
+    if (t === 'session_proposals') where = " WHERE encrypted_exchange IS NOT NULL AND encrypted_exchange != ''";
+    db.run(`INSERT OR IGNORE INTO ${t} (${list}) SELECT ${list} FROM ${t}_old${where}`);
+    db.run(`DROP TABLE ${t}_old`);
+  }
+  pendingCopies = [];
+  if (migrationChanged) {
+    try { db.run('VACUUM'); } catch (e) { console.error('[migrate] VACUUM failed:', e.message); }
+    console.log('[migrate] Minimal shapes in place');
+  }
+  // The lifetime count file (aggregate) is no longer kept.
+  for (const dir of new Set([__dirname, path.dirname(DB_PATH)])) {
+    const countFile = path.join(dir, 'witness_count.txt');
+    if (fs.existsSync(countFile)) { try { fs.unlinkSync(countFile); console.log('[migrate] Removed witness_count.txt'); } catch (e) {} }
   }
 }
 
@@ -670,77 +574,59 @@ function bootstrapCounter(key, seed) {
 
 function runCleanup() {
   const now = Math.floor(Date.now() / 1000);
-  const mintCutoff = now - (MINT_RETENTION_DAYS * 24 * 60 * 60);
+  const mintCutoff = now - (MINT_RETENTION_HOURS * 60 * 60);
   const relayCutoff = now - (RELAY_RETENTION_HOURS * 60 * 60);
   const peerCutoff = now - (PEER_STALE_HOURS * 60 * 60);
 
-  // Count before delete for lifetime counter
-  const mintsBefore = db.exec('SELECT COUNT(*) FROM witnessed_mints WHERE created_at < ?', [mintCutoff]);
-  const mintsDeleted = mintsBefore.length > 0 ? mintsBefore[0].values[0][0] : 0;
-
   db.run('DELETE FROM witnessed_mints WHERE created_at < ?', [mintCutoff]);
   db.run('DELETE FROM settlement_relay WHERE created_at < ?', [relayCutoff]);
-  db.run('DELETE FROM poh_pings WHERE created_at < ?', [mintCutoff]);
 
-  // Clean up old pair halves (resolved or expired)
-  const pairCutoff = now - (PAIR_RETENTION_DAYS * 24 * 60 * 60);
-  db.run('DELETE FROM pair_halves WHERE created_at < ?', [pairCutoff]);
-
-  // Clean up expired sessions (ephemeral, 24 hours max)
+  // Expired sessions (ephemeral, SESSION_RETENTION_HOURS max)
   const sessionCutoff = now - (SESSION_RETENTION_HOURS * 60 * 60);
-  const expiredSessions = db.exec('SELECT my_code FROM sessions WHERE created_at < ?', [sessionCutoff]);
-  const sessionCount = expiredSessions.length > 0 ? expiredSessions[0].values.length : 0;
   db.run('DELETE FROM sessions WHERE created_at < ?', [sessionCutoff]);
   db.run('DELETE FROM session_proposals WHERE created_at < ?', [sessionCutoff]);
   pruneSessionMemory(sessionCutoff * 1000);
-  // Clean up expired invite pipes and their redemption rows (ephemeral, 24 hours max)
+  // Expired invite pipes and their redemption rows (24 hours max)
   const pipeCutoff = now - (PIPE_RETENTION_HOURS * 60 * 60);
   db.run('DELETE FROM pipe_redemptions WHERE created_at < ?', [pipeCutoff]);
   db.run('DELETE FROM pipes WHERE created_at < ?', [pipeCutoff]);
-  // Clean up expired ping challenges (60 seconds max)
+  // Expired ping challenges (60 seconds max)
   db.run('DELETE FROM ping_challenges WHERE created_at < ?', [now - 60]);
-  if (sessionCount > 0) {
-    console.log(`[cleanup] Expired ${sessionCount} session halves`);
-  }
 
   // Remove stale peers (but never remove self)
-  const stalePeers = db.exec('SELECT url FROM peers WHERE last_heartbeat < ? AND url != ?', [peerCutoff, SELF_URL || '']);
-  const staleCount = stalePeers.length > 0 ? stalePeers[0].values.length : 0;
   db.run('DELETE FROM peers WHERE last_heartbeat < ? AND url != ?', [peerCutoff, SELF_URL || '']);
-
-  // Track lifetime count (deleted mints still count)
-  if (mintsDeleted > 0) {
-    const countFile = path.join(__dirname, 'witness_count.txt');
-    const existing = fs.existsSync(countFile) ? parseInt(fs.readFileSync(countFile, 'utf8')) || 0 : 0;
-    fs.writeFileSync(countFile, String(existing + mintsDeleted));
-    console.log(`[cleanup] Deleted ${mintsDeleted} expired mints`);
-  }
-  if (staleCount > 0) {
-    console.log(`[cleanup] Removed ${staleCount} stale peers`);
-  }
 
   saveDatabase();
 }
 
-// === PRESENCE REGISTRY ===
-
-function updatePresence(chainFingerprint, deviceHash, eventType) {
-  const now = Math.floor(Date.now() / 1000);
-  const existing = db.exec('SELECT first_seen, attested_ping_count, witnessed_exchange_count FROM presence_registry WHERE chain_fingerprint = ?', [chainFingerprint]);
-
-  if (existing.length > 0 && existing[0].values.length > 0) {
-    const pingInc = eventType === 'ping' ? 1 : 0;
-    const witnessInc = eventType === 'witness' ? 1 : 0;
-    db.run(
-      'UPDATE presence_registry SET last_seen = ?, attested_ping_count = attested_ping_count + ?, witnessed_exchange_count = witnessed_exchange_count + ?, last_device_hash = ? WHERE chain_fingerprint = ?',
-      [now, pingInc, witnessInc, deviceHash || '', chainFingerprint]
-    );
-  } else {
-    db.run(
-      'INSERT INTO presence_registry (chain_fingerprint, first_seen, last_seen, attested_ping_count, witnessed_exchange_count, last_device_hash) VALUES (?, ?, ?, ?, ?, ?)',
-      [chainFingerprint, now, now, eventType === 'ping' ? 1 : 0, eventType === 'witness' ? 1 : 0, deviceHash || '']
-    );
-  }
+// === REQUEST ALLOWLIST (v2.10.0, security tenet gate) ===
+// Every person-facing endpoint names the body fields it may accept.
+// Anything else is dropped before a handler sees it, so no readable field
+// can reach a row, a response or a log by accident. The allowed fields are
+// codes, fingerprints, public keys, act hash and signatures, encrypted
+// blobs, timestamps, and a few control values (confirmed, reason,
+// max_redemptions). The dropped field names are logged once each per
+// process, never their values.
+const _droppedLogged = new Set();
+function allow(fields) {
+  const set = new Set(fields);
+  return (req, res, next) => {
+    const b = req.body;
+    if (b && typeof b === 'object' && !Array.isArray(b)) {
+      const kept = {};
+      for (const k of Object.keys(b)) {
+        if (set.has(k)) kept[k] = b[k];
+        else if (!_droppedLogged.has(req.route.path + ':' + k)) {
+          _droppedLogged.add(req.route.path + ':' + k);
+          console.log(`[allowlist] ${req.method} ${req.route.path}: dropped field '${k}'`);
+        }
+      }
+      req.body = kept;
+    } else {
+      req.body = {};
+    }
+    next();
+  };
 }
 
 // === EXPRESS APP ===
@@ -759,12 +645,15 @@ app.use((req, res, next) => {
 
 // --- POST /witness ---
 // Phone submits a mint event for witnessing
-app.post('/witness', (req, res) => {
+// v2.10.0: the public keys and chain signature older apps send are dropped
+// (not needed to attest a hash, and not kept). The attestation signs
+// mint_hash:server_ts exactly as before.
+app.post('/witness', allow(['mint_hash', 'device_timestamp', 'act_hash']), (req, res) => {
   try {
-    const { mint_hash, pubkey_a, pubkey_b, device_timestamp, chain_sig, act_hash } = req.body;
+    const { mint_hash, device_timestamp, act_hash } = req.body;
 
     // Validate required fields
-    if (!mint_hash || !pubkey_a || !pubkey_b || !device_timestamp || !chain_sig) {
+    if (!mint_hash || !device_timestamp) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -794,17 +683,12 @@ app.post('/witness', (req, res) => {
     const serverSignature = sign(attestationMessage);
 
     // Store
+    // Kept for MINT_RETENTION_HOURS so a retry gets the same attestation.
+    const ah = (act_hash && /^[a-f0-9]{64}$/i.test(act_hash)) ? act_hash : null;
     db.run(
-      'INSERT INTO witnessed_mints (mint_hash, pubkey_a, pubkey_b, device_ts, server_ts, server_sig, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [mint_hash, pubkey_a, pubkey_b, device_timestamp, serverTimestamp, serverSignature, serverTimestamp]
+      'INSERT INTO witnessed_mints (mint_hash, device_ts, server_ts, server_sig, act_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [mint_hash, device_timestamp, serverTimestamp, serverSignature, ah, serverTimestamp]
     );
-    // v2.8.0: the act hash the phones folded into mint_hash, kept beside it (observe only)
-    if (act_hash && /^[a-f0-9]{64}$/i.test(act_hash)) {
-      try { db.run('UPDATE witnessed_mints SET act_hash = ? WHERE mint_hash = ?', [act_hash, mint_hash]); } catch(e) {}
-    }
-
-    witnessedCount++;
-    incrementCounter('mints_lifetime');
     saveDatabase();
 
     console.log(`[witness] New attestation: ${mint_hash.substring(0, 16)}...`);
@@ -825,7 +709,7 @@ app.post('/witness', (req, res) => {
 
 // --- POST /ping/challenge ---
 // Issue a time-limited nonce for challenge-response ping verification
-app.post('/ping/challenge', (req, res) => {
+app.post('/ping/challenge', allow(['chain_fingerprint']), (req, res) => {
   try {
     const { chain_fingerprint } = req.body;
     if (!chain_fingerprint || !/^[a-f0-9]+$/i.test(chain_fingerprint)) {
@@ -852,19 +736,28 @@ app.post('/ping/challenge', (req, res) => {
 });
 
 // --- POST /ping ---
-// Proof-of-Human genesis ping attestation
-// No counterparty -- just "this chain's device pinged at this time"
-app.post('/ping', (req, res) => {
+// Proof-of-Human heartbeat attestation. Sign and return; store nothing
+// but the 60-second challenge (Oct 8 ruling). v2.10.0: the ping may carry
+// head_hash, the hash of the chain's latest record (the ping record
+// itself), and the witness signs it in:
+//   ping2:<fingerprint>:<head_hash>:<server_ts>
+// Rewriting anything before that record then breaks the signature, and a
+// witness cannot sign a past time (registry, Component 1, "PING ANCHORS
+// THE CHAIN'S HISTORY", Oct 13). Without head_hash (older apps) the old
+// message is signed: ping:<fingerprint>::<server_ts>. The sensor hash
+// older apps send is dropped by the allowlist and no longer signed.
+app.post('/ping', allow(['chain_fingerprint', 'device_ts', 'challenge_nonce', 'head_hash']), (req, res) => {
   try {
-    const { chain_fingerprint, sensor_hash, device_ts, seq, challenge_nonce } = req.body;
+    const { chain_fingerprint, device_ts, challenge_nonce, head_hash } = req.body;
 
     if (!chain_fingerprint || !device_ts) {
       return res.status(400).json({ error: 'Missing required fields (chain_fingerprint, device_ts)' });
     }
-
-    // Validate chain_fingerprint format (should be hex, 16 chars)
     if (!/^[a-f0-9]+$/i.test(chain_fingerprint)) {
       return res.status(400).json({ error: 'Invalid chain_fingerprint format' });
+    }
+    if (head_hash !== undefined && head_hash !== null && !/^[a-f0-9]{64}$/i.test(head_hash)) {
+      return res.status(400).json({ error: 'Invalid head_hash format' });
     }
 
     // Verify challenge-response if nonce provided
@@ -880,32 +773,21 @@ app.post('/ping', (req, res) => {
         if (now - issuedAt <= 10) {
           challenged = true;
         }
-        // Delete used challenge regardless
-        db.run('DELETE FROM ping_challenges WHERE nonce = ?', [challenge_nonce]);
       }
+      // Delete used challenge regardless
+      db.run('DELETE FROM ping_challenges WHERE nonce = ?', [challenge_nonce]);
     }
 
     const serverTimestamp = Math.floor(Date.now() / 1000);
-    const pingMessage = 'ping:' + chain_fingerprint + ':' + (sensor_hash || '') + ':' + serverTimestamp;
+    const head = head_hash ? head_hash.toLowerCase() : null;
+    const pingMessage = head
+      ? 'ping2:' + chain_fingerprint + ':' + head + ':' + serverTimestamp
+      : 'ping:' + chain_fingerprint + '::' + serverTimestamp;
     const serverSignature = sign(pingMessage);
-
-    // Store
-    db.run(
-      'INSERT INTO poh_pings (chain_fingerprint, sensor_hash, device_ts, server_ts, server_sig, seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [chain_fingerprint, sensor_hash || '', device_ts, serverTimestamp, serverSignature, seq || 0, serverTimestamp]
-    );
-
-    // Update presence registry
-    updatePresence(chain_fingerprint, sensor_hash, 'ping');
-
-    pohPingCount++;
-    incrementCounter('pings_lifetime');
-    saveDatabase();
-
-    console.log(`[ping] PoH attestation: chain ${chain_fingerprint.substring(0, 8)}... seq ${seq || 0} challenged=${challenged}`);
 
     res.json({
       chain_fingerprint,
+      head_hash: head,
       server_timestamp: serverTimestamp,
       server_signature: serverSignature,
       server_pubkey: serverKeys.publicKeyHex,
@@ -918,43 +800,12 @@ app.post('/ping', (req, res) => {
   }
 });
 
-// --- GET /presence/:fingerprint ---
-// Return presence summary for a chain fingerprint
-app.get('/presence/:fingerprint', (req, res) => {
-  try {
-    const { fingerprint } = req.params;
-    if (!fingerprint || !/^[a-f0-9]+$/i.test(fingerprint)) {
-      return res.status(400).json({ error: 'Invalid fingerprint format' });
-    }
-
-    const row = db.exec(
-      'SELECT first_seen, last_seen, attested_ping_count, witnessed_exchange_count, last_device_hash FROM presence_registry WHERE chain_fingerprint = ?',
-      [fingerprint]
-    );
-
-    if (row.length === 0 || row[0].values.length === 0) {
-      return res.json({ found: false });
-    }
-
-    const r = row[0].values[0];
-    res.json({
-      found: true,
-      chain_fingerprint: fingerprint,
-      first_seen: r[0],
-      last_seen: r[1],
-      attested_ping_count: r[2],
-      witnessed_exchange_count: r[3],
-      last_device_hash: r[4] || '',
-    });
-  } catch (e) {
-    console.error('[presence] Error:', e.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// GET /presence/:fingerprint was removed in v2.10.0 (Oct 13 ruling): a
+// public lookup of when a chain was seen is surveillance. Falls to 404.
 
 // --- PUT /relay/:handshake_id ---
 // Phone A deposits encrypted settlement for Phone B
-app.put('/relay/:handshake_id', (req, res) => {
+app.put('/relay/:handshake_id', allow(['encrypted_payload']), (req, res) => {
   try {
     const { handshake_id } = req.params;
     const { encrypted_payload } = req.body;
@@ -1416,7 +1267,7 @@ async function announceToServer(targetUrl) {
     url: SELF_URL,
     pubkey: serverKeys.publicKeyHex,
     version: VERSION,
-    witnessed_count: witnessedCount,
+    witnessed_count: 0, // v2.10.0: no aggregate counts (No dashboard ruling); field kept for older peers
     peers: getActivePeers(),
   };
   try {
@@ -1482,7 +1333,7 @@ async function announceSignedToServer(targetUrl, targetPubkey) {
     pubkey: serverKeys.publicKeyHex,
     endpoint: { host: SELF_HOST, port: SELF_PORT_PUBLIC },
     version: VERSION,
-    witnessed_count: witnessedCount,
+    witnessed_count: 0, // v2.10.0: no aggregate counts (No dashboard ruling); field kept for older peers
     sequence,
     signed_at: now,
     peers,
@@ -1570,7 +1421,7 @@ async function heartbeat() {
     db.run('DELETE FROM peers WHERE url = ?', [selfClean]);
     db.run(
       'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [selfClean, serverKeys.publicKeyHex, VERSION, witnessedCount, now, now]
+      [selfClean, serverKeys.publicKeyHex, VERSION, 0, now, now]
     );
     saveDatabase();
   }
@@ -1653,316 +1504,45 @@ async function heartbeat() {
   console.log(`[gossip] Heartbeat: ${signedCount} signed + ${legacyCount} legacy`);
 }
 
-// --- GET /status (updated with peer count) ---
-// Health check and network info
+// --- GET /status ---
+// Health check and identity. v2.10.0: no activity counts of any kind
+// (No dashboard ruling, Oct 6): what a witness has attested, how many
+// sessions are open, how many pings it signed are nobody's business.
 app.get('/status', (req, res) => {
-  const uptimeSeconds = Math.floor((Date.now() - startTime) / 1000);
-  const currentMints = db.exec('SELECT COUNT(*) FROM witnessed_mints');
-  const pendingRelays = db.exec('SELECT COUNT(*) FROM settlement_relay');
-  const pendingPairs = db.exec('SELECT COUNT(*) FROM pair_halves WHERE resolved = 0');
-  const activeSessions = db.exec('SELECT COUNT(*) FROM sessions');
-  const pendingProposals = db.exec("SELECT COUNT(*) FROM session_proposals WHERE status = 'pending'");
-  const activePeers = getActivePeers();
-
   res.json({
     server_pubkey: serverKeys.publicKeyHex,
     version: VERSION,
     url: SELF_URL || null,
-    uptime_seconds: uptimeSeconds,
-    witnessed_total: witnessedCount,
-    witnessed_current: currentMints.length > 0 ? currentMints[0].values[0][0] : 0,
-    poh_pings_total: pohPingCount,
-    pending_relays: pendingRelays.length > 0 ? pendingRelays[0].values[0][0] : 0,
-    pending_pairs: pendingPairs.length > 0 ? pendingPairs[0].values[0][0] : 0,
-    active_sessions: activeSessions.length > 0 ? activeSessions[0].values[0][0] : 0,
-    pending_proposals: pendingProposals.length > 0 ? pendingProposals[0].values[0][0] : 0,
-    peer_count: activePeers.length,
+    uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+    peer_count: getActivePeers().length,
     timestamp: Math.floor(Date.now() / 1000),
     retention: {
-      mints_days: MINT_RETENTION_DAYS,
+      mints_hours: MINT_RETENTION_HOURS,
+      sessions_hours: SESSION_RETENTION_HOURS,
       relay_hours: RELAY_RETENTION_HOURS,
     },
   });
 });
 
 // --- GET /stats ---
-// Public-facing aggregate counts for the marketing-site admin
-// dashboard. Distinct from /status: /stats is non-operational
-// (no pending pairs, no active sessions, no traffic-pattern
-// signals), and lifetime totals come from the persistent counters
-// table so they survive restart and table cleanup.
-//
-// Window definitions:
-// - today  = events created in the last 24 hours
-// - week   = events created in the last 7 days
-// - lifetime = persistent counter (counters table)
-//
-// Lifetime can exceed today/week + (older rows) because the rows
-// table is subject to retention cleanup. The counter is the
-// monotonic source of truth for lifetime; the rows table answers
-// "today/week" via timestamp filter.
+// v2.10.0: version, uptime and peer count only (No dashboard ruling).
+// GET /stats/daily was removed.
 app.get('/stats', (req, res) => {
-  const now = Math.floor(Date.now() / 1000);
-  const oneDayAgo = now - 24 * 60 * 60;
-  const oneWeekAgo = now - 7 * 24 * 60 * 60;
-
-  function countSince(table, column, ts) {
-    const r = db.exec(`SELECT COUNT(*) FROM ${table} WHERE ${column} >= ?`, [ts]);
-    return r.length > 0 ? r[0].values[0][0] : 0;
-  }
-
-  // Peer summaries.
-  const totalActive = db.exec(
-    'SELECT COUNT(*) FROM peers WHERE last_heartbeat >= ?',
-    [now - PEER_STALE_HOURS * 60 * 60]
-  );
-  const reachableSigned = db.exec(
-    'SELECT COUNT(*) FROM peers WHERE last_heartbeat >= ? AND host IS NOT NULL AND port IS NOT NULL AND reachable = 1',
-    [now - PEER_STALE_HOURS * 60 * 60]
-  );
-
   res.json({
     server_pubkey: serverKeys.publicKeyHex,
     version: VERSION,
     uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-    mints: {
-      today: countSince('witnessed_mints', 'created_at', oneDayAgo),
-      week: countSince('witnessed_mints', 'created_at', oneWeekAgo),
-      lifetime: getCounter('mints_lifetime'),
-    },
-    pings: {
-      today: countSince('poh_pings', 'created_at', oneDayAgo),
-      week: countSince('poh_pings', 'created_at', oneWeekAgo),
-      lifetime: getCounter('pings_lifetime'),
-    },
-    peers: {
-      signed: reachableSigned.length > 0 ? reachableSigned[0].values[0][0] : 0,
-      total: totalActive.length > 0 ? totalActive[0].values[0][0] : 0,
-    },
-    as_of: now,
+    peer_count: getActivePeers().length,
+    as_of: Math.floor(Date.now() / 1000),
   });
 });
 
-// --- GET /stats/daily ---
-// Per-day attestation counts for the marketing-site analytics
-// dashboard. Returns mints (and pings) grouped by UTC day for the
-// last N days (default 30, max 365 via ?days=).
-//
-// Unauthenticated and intended for public consumption: the counts
-// themselves do not leak operational signal beyond what /stats
-// already publishes. No per-actor or per-payload data is exposed.
-app.get('/stats/daily', (req, res) => {
-  const daysParam = parseInt(req.query.days, 10);
-  const days = Math.max(1, Math.min(365, isNaN(daysParam) ? 30 : daysParam));
-  const now = Math.floor(Date.now() / 1000);
-  const cutoff = now - days * 24 * 60 * 60;
-
-  function dailyBuckets(table, column) {
-    // SQLite has date() that takes a unix epoch with the 'unixepoch'
-    // modifier. Group by that to get one row per UTC day.
-    const r = db.exec(
-      `SELECT date(${column}, 'unixepoch') AS day, COUNT(*) AS count
-       FROM ${table}
-       WHERE ${column} >= ?
-       GROUP BY day
-       ORDER BY day DESC`,
-      [cutoff]
-    );
-    if (r.length === 0) return [];
-    return r[0].values.map(row => ({ day: row[0], count: row[1] }));
-  }
-
-  res.json({
-    server_pubkey: serverKeys.publicKeyHex,
-    window_days: days,
-    days: dailyBuckets('witnessed_mints', 'created_at'),
-    pings: dailyBuckets('poh_pings', 'created_at'),
-    as_of: now,
-  });
-});
-
-// --- POST /pair ---
-// Phone submits one half of a pairing code exchange
-app.post('/pair', (req, res) => {
-  try {
-    const { my_code, their_code, value, direction, description, category, duration, fingerprint, public_key, timestamp, device_ts, device_hash } = req.body;
-
-    // Validate required fields
-    if (!my_code || !their_code || value === undefined || !direction || !fingerprint || !public_key) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    // Validate codes. 6 alphanumeric characters
-    if (!/^[A-Z]{6}$/.test(my_code) || !/^[A-Z]{6}$/.test(their_code)) {
-      return res.status(400).json({ error: 'Invalid code format' });
-    }
-
-    // Validate direction
-    if (!encrypted_exchange && direction !== 'provided' && direction !== 'received') {
-      return res.status(400).json({ error: 'Invalid direction' });
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-
-    // Check if this code already submitted (idempotent)
-    const existing = db.exec('SELECT resolved, resolve_status, counterparty_fp, counterparty_key, counterparty_desc, their_code FROM pair_halves WHERE my_code = ?', [my_code]);
-    if (existing.length > 0 && existing[0].values.length > 0) {
-      const row = existing[0].values[0];
-      if (row[0]) {
-        // Already resolved -- return result with counterparty device_ts and device_hash
-        let cpDeviceTs = null;
-        let cpDeviceHash = '';
-        const cpCode = row[5];
-        if (cpCode) {
-          const cpRow = db.exec('SELECT device_ts, device_hash FROM pair_halves WHERE my_code = ?', [cpCode]);
-          if (cpRow.length > 0 && cpRow[0].values.length > 0) {
-            cpDeviceTs = cpRow[0].values[0][0] || null;
-            cpDeviceHash = cpRow[0].values[0][1] || '';
-          }
-        }
-        return res.json({
-          stored: true,
-          resolved: true,
-          status: row[1],
-          counterparty_fp: row[2],
-          counterparty_key: row[3] ? JSON.parse(row[3]) : null,
-          counterparty_desc: row[4] || '',
-          counterparty_device_ts: cpDeviceTs,
-          counterparty_device_hash: cpDeviceHash,
-        });
-      }
-      // Already stored but not resolved. Update and re-check
-      return res.json({ stored: true, resolved: false, status: 'waiting' });
-    }
-
-    // Store this half
-    db.run(
-      `INSERT INTO pair_halves (my_code, their_code, value, direction, description, category, duration, fingerprint, public_key, timestamp, device_ts, device_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [my_code, their_code, value, direction, description || '', category || '', duration || 0,
-       fingerprint, JSON.stringify(public_key), timestamp || new Date().toISOString(), device_ts || null, device_hash || '', now]
-    );
-
-    console.log(`[pair] Stored half: ${my_code} -> ${their_code}`);
-
-    // Check for matching half: the other person's my_code should be our their_code,
-    // and their their_code should be our my_code
-    const match = db.exec(
-      'SELECT my_code, value, direction, fingerprint, public_key, description, device_ts, device_hash FROM pair_halves WHERE my_code = ? AND their_code = ?',
-      [their_code, my_code]
-    );
-
-    if (match.length > 0 && match[0].values.length > 0) {
-      const other = match[0].values[0];
-      const otherValue = other[1];
-      const otherDirection = other[2];
-      const otherFp = other[3];
-      const otherKey = other[4];
-      const otherDesc = other[5] || '';
-      const otherDeviceTs = other[6] || null;
-      const otherDeviceHash = other[7] || '';
-
-      // Check: values must match exactly, directions must be complementary
-      const valuesMatch = Math.abs(value - otherValue) < 0.001;
-      const directionsComplement =
-        (direction === 'provided' && otherDirection === 'received') ||
-        (direction === 'received' && otherDirection === 'provided');
-
-      if (valuesMatch && directionsComplement) {
-        // Match. Resolve both halves and store each other's descriptions
-        db.run('UPDATE pair_halves SET resolved = 1, resolve_status = ?, counterparty_fp = ?, counterparty_key = ?, counterparty_desc = ? WHERE my_code = ?',
-          ['matched', otherFp, otherKey, otherDesc, my_code]);
-        db.run('UPDATE pair_halves SET resolved = 1, resolve_status = ?, counterparty_fp = ?, counterparty_key = ?, counterparty_desc = ? WHERE my_code = ?',
-          ['matched', fingerprint, JSON.stringify(public_key), description || '', their_code]);
-
-        saveDatabase();
-        console.log(`[pair] Matched: ${my_code} <-> ${their_code}`);
-
-        return res.json({
-          stored: true,
-          resolved: true,
-          status: 'matched',
-          counterparty_fp: otherFp,
-          counterparty_key: JSON.parse(otherKey),
-          counterparty_desc: otherDesc,
-          counterparty_device_ts: otherDeviceTs,
-          counterparty_device_hash: otherDeviceHash,
-        });
-      } else {
-        // Codes cross-reference but values or directions don't match
-        const reason = !valuesMatch ? 'value_mismatch' : 'direction_mismatch';
-        db.run('UPDATE pair_halves SET resolved = 1, resolve_status = ? WHERE my_code = ?', [reason, my_code]);
-        db.run('UPDATE pair_halves SET resolved = 1, resolve_status = ? WHERE my_code = ?', [reason, their_code]);
-
-        saveDatabase();
-        console.log(`[pair] Mismatch (${reason}): ${my_code} <-> ${their_code}`);
-
-        return res.json({ stored: true, resolved: true, status: reason });
-      }
-    }
-
-    // No match yet. Other half hasn't arrived
-    saveDatabase();
-    res.json({ stored: true, resolved: false, status: 'waiting' });
-  } catch (e) {
-    console.error('[pair] POST error:', e.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// --- GET /pair/check/:code ---
-// Phone polls to check if its pair half has been resolved
-app.get('/pair/check/:code', (req, res) => {
-  try {
-    const { code } = req.params;
-
-    if (!/^[A-Z]{6}$/.test(code)) {
-      return res.status(400).json({ error: 'Invalid code format' });
-    }
-
-    const result = db.exec(
-      'SELECT resolved, resolve_status, counterparty_fp, counterparty_key, counterparty_desc, their_code FROM pair_halves WHERE my_code = ?',
-      [code]
-    );
-
-    if (result.length === 0 || result[0].values.length === 0) {
-      return res.status(404).json({ found: false });
-    }
-
-    const row = result[0].values[0];
-    const resolved = row[0] === 1;
-
-    if (!resolved) {
-      return res.json({ found: true, resolved: false, status: 'waiting' });
-    }
-
-    // Fetch counterparty's device_ts and device_hash from their pair half
-    const theirCode = row[5];
-    let counterpartyDeviceTs = null;
-    let counterpartyDeviceHash = '';
-    if (theirCode) {
-      const otherHalf = db.exec('SELECT device_ts, device_hash FROM pair_halves WHERE my_code = ?', [theirCode]);
-      if (otherHalf.length > 0 && otherHalf[0].values.length > 0) {
-        counterpartyDeviceTs = otherHalf[0].values[0][0] || null;
-        counterpartyDeviceHash = otherHalf[0].values[0][1] || '';
-      }
-    }
-
-    res.json({
-      found: true,
-      resolved: true,
-      status: row[1],
-      counterparty_fp: row[2],
-      counterparty_key: row[3] ? JSON.parse(row[3]) : null,
-      counterparty_desc: row[4] || '',
-      counterparty_device_ts: counterpartyDeviceTs,
-      counterparty_device_hash: counterpartyDeviceHash,
-    });
-  } catch (e) {
-    console.error('[pair] CHECK error:', e.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// --- POST /pair, GET /pair/check/:code ---
+// Retired in v2.10.0. A pair half carried the terms of an exchange in
+// clear (value, direction, description), which no witness may hold. The
+// app withdrew pair-with-codes in v2.134.0 until it has a sealed design.
+app.post('/pair', (req, res) => res.status(410).json({ error: 'gone', reason: 'Pair-with-codes is retired: it sent exchange terms in clear' }));
+app.get('/pair/check/:code', (req, res) => res.status(410).json({ error: 'gone' }));
 
 // === SESSION ENDPOINTS ===
 // Ephemeral pipe: exchange codes → share threads → propose → confirm → chains write → pipe closes.
@@ -2023,11 +1603,25 @@ function pruneSessionMemory(cutoffMs) {
   for (const [k, c] of sessionCancelled) if (c.at < cutoffMs) { sessionCancelled.delete(k); sessionWouldCancel.delete(k); }
 }
 
+// Older apps read these keys; they are constant placeholders and carry
+// nothing. The terms travel only inside encrypted_exchange.
+const PROPOSAL_PLACEHOLDERS = { value: 0, direction: '', description: '', category: '', duration: 0 };
+
+function partnerView(row) {
+  return {
+    fingerprint: row[0],
+    public_key: row[1] ? JSON.parse(row[1]) : null,
+    encrypted_snapshot: row[2] || null,
+  };
+}
+
 // --- POST /session/join ---
-// Phone joins a session with its code, partner's code, identity, and optional thread snapshot
-app.post('/session/join', (req, res) => {
+// Phone joins a session with its code, its partner's code and its key.
+// v2.10.0: no plaintext snapshot and no role on the join; anything the
+// other phone needs travels in the encrypted snapshot.
+app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public_key']), (req, res) => {
   try {
-    const { my_code, their_code, fingerprint, public_key, thread_snapshot, role } = req.body;
+    const { my_code, their_code, fingerprint, public_key } = req.body;
 
     if (!my_code || !their_code || !fingerprint || !public_key) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -2042,45 +1636,24 @@ app.post('/session/join', (req, res) => {
     const now = Math.floor(Date.now() / 1000);
     touchSession(my_code);
 
-    // Check if already joined (idempotent)
     const existing = db.exec('SELECT my_code FROM sessions WHERE my_code = ?', [my_code]);
     if (existing.length === 0 || existing[0].values.length === 0) {
       db.run(
-        'INSERT INTO sessions (my_code, their_code, fingerprint, public_key, thread_snapshot, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [my_code, their_code, fingerprint, JSON.stringify(public_key), thread_snapshot || null, role || null, now]
+        'INSERT INTO sessions (my_code, their_code, fingerprint, public_key, created_at) VALUES (?, ?, ?, ?, ?)',
+        [my_code, their_code, fingerprint, JSON.stringify(public_key), now]
       );
-      console.log(`[session] Joined: ${my_code} -> ${their_code}` + (thread_snapshot ? ' (with thread snapshot)' : ' (no thread snapshot)'));
-    } else {
-      // Update thread snapshot if provided
-      if (thread_snapshot) {
-        db.run('UPDATE sessions SET thread_snapshot = ? WHERE my_code = ?', [thread_snapshot, my_code]);
-      }
+      console.log(`[session] Joined: ${my_code} -> ${their_code}`);
+      saveDatabase();
     }
 
-    saveDatabase();
-
-    // Check if partner has joined (codes cross-reference)
     const partner = db.exec(
-      'SELECT fingerprint, public_key, thread_snapshot, encrypted_snapshot, role FROM sessions WHERE my_code = ? AND their_code = ?',
+      'SELECT fingerprint, public_key, encrypted_snapshot FROM sessions WHERE my_code = ? AND their_code = ?',
       [their_code, my_code]
     );
-
     if (partner.length > 0 && partner[0].values.length > 0) {
-      const p = partner[0].values[0];
       console.log(`[session] Connected: ${my_code} <-> ${their_code}`);
-      return res.json({
-        joined: true,
-        connected: true,
-        partner: {
-          fingerprint: p[0],
-          public_key: p[1] ? JSON.parse(p[1]) : null,
-          thread_snapshot: p[2] ? JSON.parse(p[2]) : null,
-          encrypted_snapshot: p[3] || null,
-          role: p[4] || null,
-        },
-      });
+      return res.json({ joined: true, connected: true, partner: partnerView(partner[0].values[0]) });
     }
-
     res.json({ joined: true, connected: false });
   } catch (e) {
     console.error('[session] JOIN error:', e.message);
@@ -2089,7 +1662,7 @@ app.post('/session/join', (req, res) => {
 });
 
 // --- GET /session/:code ---
-// Phone polls for session state: connected? thread? proposal? confirmation?
+// Phone polls for session state: connected? sealed snapshot? proposal?
 app.get('/session/:code', (req, res) => {
   try {
     const { code } = req.params;
@@ -2097,7 +1670,6 @@ app.get('/session/:code', (req, res) => {
       return res.status(400).json({ error: 'Invalid code format' });
     }
 
-    // Find my session entry
     const me = db.exec('SELECT their_code FROM sessions WHERE my_code = ?', [code]);
     if (me.length === 0 || me[0].values.length === 0) {
       return res.status(404).json({ found: false });
@@ -2105,69 +1677,34 @@ app.get('/session/:code', (req, res) => {
     const theirCode = me[0].values[0][0];
     touchSession(code);
 
-    // Check if partner has joined
     const partner = db.exec(
-      'SELECT fingerprint, public_key, thread_snapshot, encrypted_snapshot, role FROM sessions WHERE my_code = ? AND their_code = ?',
+      'SELECT fingerprint, public_key, encrypted_snapshot FROM sessions WHERE my_code = ? AND their_code = ?',
       [theirCode, code]
     );
-
     const connected = partner.length > 0 && partner[0].values.length > 0;
     const result = { found: true, connected };
+    if (connected) result.partner = partnerView(partner[0].values[0]);
 
-    if (connected) {
-      const p = partner[0].values[0];
-      result.partner = {
-        fingerprint: p[0],
-        public_key: p[1] ? JSON.parse(p[1]) : null,
-        thread_snapshot: p[2] ? JSON.parse(p[2]) : null,
-        encrypted_snapshot: p[3] || null,
-        role: p[4] || null,
-      };
-    }
-
-    // Check for proposal
     const sKey = sessionKey(code, theirCode);
     const proposal = db.exec(
-      'SELECT proposer_code, value, direction, description, category, duration, status, confirmer_desc, device_ts, confirmer_device_ts, sensor_hash, platform, confirmer_sensor_hash, confirmer_platform, geo, confirmer_geo, device_hash, confirmer_device_hash, proposer_photo, confirmer_photo, proposer_photo_hash, confirmer_photo_hash, encrypted_exchange FROM session_proposals WHERE session_key = ?',
+      'SELECT proposer_code, status, encrypted_exchange, device_ts, confirmer_device_ts, act_hash, proposer_act_sig, confirmer_act_sig FROM session_proposals WHERE session_key = ?',
       [sKey]
     );
-
     if (proposal.length > 0 && proposal[0].values.length > 0) {
       const pr = proposal[0].values[0];
-      result.proposal = {
+      result.proposal = Object.assign({}, PROPOSAL_PLACEHOLDERS, {
         proposer_code: pr[0],
-        value: pr[1],
-        direction: pr[2],
-        description: pr[3],
-        category: pr[4],
-        duration: pr[5],
-        status: pr[6],
-        confirmer_desc: pr[7] || '',
-        device_ts: pr[8] || null,
-        confirmer_device_ts: pr[9] || null,
-        sensor_hash: pr[10] || '',
-        platform: pr[11] || '',
-        confirmer_sensor_hash: pr[12] || '',
-        confirmer_platform: pr[13] || '',
-        geo: pr[14] || '',
-        confirmer_geo: pr[15] || '',
-        device_hash: pr[16] || '',
-        confirmer_device_hash: pr[17] || '',
-        proposer_photo: pr[18] || '',
-        confirmer_photo: pr[19] || '',
-        proposer_photo_hash: pr[20] || '',
-        confirmer_photo_hash: pr[21] || '',
-        encrypted_exchange: pr[22] || '',
-      };
-      const actRow = db.exec('SELECT act_hash, proposer_act_sig, confirmer_act_sig FROM session_proposals WHERE session_key = ?', [sKey]);
-      if (actRow.length && actRow[0].values.length) {
-        result.proposal.act_hash = actRow[0].values[0][0] || '';
-        result.proposal.proposer_act_sig = actRow[0].values[0][1] || '';
-        result.proposal.confirmer_act_sig = actRow[0].values[0][2] || '';
-      }
+        status: pr[1],
+        encrypted_exchange: pr[2] || '',
+        device_ts: pr[3] || null,
+        confirmer_device_ts: pr[4] || null,
+        act_hash: pr[5] || '',
+        proposer_act_sig: pr[6] || '',
+        confirmer_act_sig: pr[7] || '',
+      });
     }
 
-    // Presence and cancel (v2.7.0). Additive fields; older apps ignore them.
+    // Presence and cancel (v2.7.0). In memory only; older apps ignore them.
     if (connected) {
       const pres = sessionPresence(theirCode);
       result.partner_present = pres.present;
@@ -2194,36 +1731,25 @@ app.get('/session/:code', (req, res) => {
 });
 
 // --- POST /session/:code/thread ---
-// Push or update thread snapshot for this session
-app.post('/session/:code/thread', (req, res) => {
+// Push or update this phone's sealed snapshot. v2.10.0: encrypted only.
+app.post('/session/:code/thread', allow(['encrypted_snapshot']), (req, res) => {
   try {
     const { code } = req.params;
-    const { thread_snapshot, encrypted_snapshot } = req.body;
+    const { encrypted_snapshot } = req.body;
     if (!validSessionCode(code)) {
       return res.status(400).json({ error: 'Invalid code format' });
     }
-    if (!thread_snapshot && !encrypted_snapshot) {
-      return res.status(400).json({ error: 'Missing thread_snapshot or encrypted_snapshot' });
+    if (!encrypted_snapshot || typeof encrypted_snapshot !== 'string') {
+      return res.status(400).json({ error: 'Missing encrypted_snapshot (plaintext snapshots are refused)' });
     }
-
     const existing = db.exec('SELECT my_code FROM sessions WHERE my_code = ?', [code]);
     if (existing.length === 0 || existing[0].values.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
     touchSession(code);
-
-    if (thread_snapshot) {
-      db.run('UPDATE sessions SET thread_snapshot = ? WHERE my_code = ?', [
-        typeof thread_snapshot === 'string' ? thread_snapshot : JSON.stringify(thread_snapshot),
-        code
-      ]);
-    }
-    if (encrypted_snapshot) {
-      db.run('UPDATE sessions SET encrypted_snapshot = ? WHERE my_code = ?', [encrypted_snapshot, code]);
-    }
+    db.run('UPDATE sessions SET encrypted_snapshot = ? WHERE my_code = ?', [encrypted_snapshot, code]);
     saveDatabase();
-
-    console.log(`[session] Thread snapshot updated: ${code}` + (encrypted_snapshot ? ' (encrypted)' : ''));
+    console.log(`[session] Sealed snapshot updated: ${code}`);
     res.json({ updated: true });
   } catch (e) {
     console.error('[session] THREAD error:', e.message);
@@ -2232,23 +1758,24 @@ app.post('/session/:code/thread', (req, res) => {
 });
 
 // --- POST /session/:code/propose ---
-// One person submits the full proposal through the session
-app.post('/session/:code/propose', (req, res) => {
+// One phone submits the sealed proposal. v2.10.0: encrypted_exchange is
+// required; an unsealed proposal is refused. The act hash and the
+// proposer's signature over it ride beside the sealed packet.
+app.post('/session/:code/propose', allow(['encrypted_exchange', 'act_hash', 'act_sig', 'device_ts']), (req, res) => {
   try {
     const { code } = req.params;
-    const { value, direction, description, category, duration, device_ts, sensor_hash, platform, geo, device_hash, photo, photo_hash, encrypted_exchange, act_hash, act_sig } = req.body;
+    const { encrypted_exchange, act_hash, act_sig, device_ts } = req.body;
 
     if (!validSessionCode(code)) {
       return res.status(400).json({ error: 'Invalid code format' });
     }
-    if (value === undefined || (!direction && !encrypted_exchange) || (!description && !encrypted_exchange)) {
-      return res.status(400).json({ error: 'Missing required proposal fields' });
+    if (!encrypted_exchange || typeof encrypted_exchange !== 'string') {
+      return res.status(400).json({ error: 'unsealed', reason: 'A proposal must be sealed (encrypted_exchange)' });
     }
-    if (!encrypted_exchange && direction !== 'provided' && direction !== 'received') {
-      return res.status(400).json({ error: 'Invalid direction' });
+    if (act_hash && !/^[a-f0-9]{64}$/i.test(act_hash)) {
+      return res.status(400).json({ error: 'Invalid act_hash format' });
     }
 
-    // Verify session exists and is connected
     const me = db.exec('SELECT their_code, fingerprint FROM sessions WHERE my_code = ?', [code]);
     if (me.length === 0 || me[0].values.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
@@ -2261,8 +1788,6 @@ app.post('/session/:code/propose', (req, res) => {
       return res.status(409).json({ error: 'Session not yet connected. Partner has not joined' });
     }
     // Same-owner rule (v2.9.0, protocol): a chain cannot exchange with itself.
-    // The witness sees root fingerprints only (the parent key travels inside
-    // the encrypted snapshot), so it enforces the same-root half of the rule.
     if (myFp && partner[0].values[0][1] && myFp === partner[0].values[0][1]) {
       console.log(`[session] Refused proposal ${code}: both sides are the same chain`);
       return res.status(409).json({ error: 'same_chain', reason: 'A chain cannot exchange with itself' });
@@ -2275,35 +1800,21 @@ app.post('/session/:code/propose', (req, res) => {
       return res.status(409).json({ error: 'Session cancelled' });
     }
 
-    // Check for existing proposal
     const existing = db.exec('SELECT status FROM session_proposals WHERE session_key = ?', [sKey]);
     if (existing.length > 0 && existing[0].values.length > 0) {
-      const status = existing[0].values[0][0];
-      if (status === 'confirmed') {
+      if (existing[0].values[0][0] === 'confirmed') {
         return res.status(409).json({ error: 'Proposal already confirmed' });
       }
-      // Allow re-proposal (overwrite pending proposal)
-      db.run('DELETE FROM session_proposals WHERE session_key = ?', [sKey]);
+      db.run('DELETE FROM session_proposals WHERE session_key = ?', [sKey]); // re-proposal overwrites
     }
 
     db.run(
-      `INSERT INTO session_proposals (session_key, proposer_code, value, direction, description, category, duration, status, device_ts, sensor_hash, platform, geo, device_hash, proposer_photo, proposer_photo_hash, encrypted_exchange, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [sKey, code, value, direction, description, category || '', duration || 0, device_ts || null, sensor_hash || '', platform || '', geo || '', device_hash || '', photo || '', photo_hash || '', encrypted_exchange || '', now]
+      `INSERT INTO session_proposals (session_key, proposer_code, status, encrypted_exchange, act_hash, proposer_act_sig, device_ts, created_at)
+       VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`,
+      [sKey, code, encrypted_exchange, act_hash || '', act_sig || '', Number.isFinite(device_ts) ? device_ts : null, now]
     );
-
-    // Update presence
-    const fpRow = db.exec('SELECT fingerprint FROM sessions WHERE my_code = ?', [code]);
-    if (fpRow.length > 0 && fpRow[0].values.length > 0) {
-      updatePresence(fpRow[0].values[0][0], device_hash, 'session');
-    }
-
-    if (act_hash || act_sig) {
-      db.run('UPDATE session_proposals SET act_hash = ?, proposer_act_sig = ? WHERE session_key = ?', [act_hash || '', act_sig || '', sKey]);
-    }
     saveDatabase();
-    console.log(`[session] Proposal submitted: ${code} in session ${sKey}` + (act_hash ? ' (act hash)' : ''));
-
+    console.log(`[session] Sealed proposal: ${code} in session ${sKey}`);
     res.json({ proposed: true, session_key: sKey });
   } catch (e) {
     console.error('[session] PROPOSE error:', e.message);
@@ -2314,7 +1825,7 @@ app.post('/session/:code/propose', (req, res) => {
 // --- POST /session/:code/cancel ---
 // Either person ends the exchange for both (DESIGN 2b). Nothing is
 // recorded. reason is 'cancelled' (default) or 'disconnected'.
-app.post('/session/:code/cancel', (req, res) => {
+app.post('/session/:code/cancel', allow(['reason']), (req, res) => {
   try {
     const { code } = req.params;
     const reason = (req.body || {}).reason;
@@ -2344,11 +1855,11 @@ app.post('/session/:code/cancel', (req, res) => {
 });
 
 // --- POST /session/:code/confirm ---
-// The other person confirms (or rejects) the proposal
-app.post('/session/:code/confirm', (req, res) => {
+// The other phone confirms (or rejects) the sealed proposal.
+app.post('/session/:code/confirm', allow(['confirmed', 'act_sig', 'device_ts']), (req, res) => {
   try {
     const { code } = req.params;
-    const { act_sig: confirmerActSig, confirmed, description: confirmerDesc, device_ts: confirmerDeviceTs, sensor_hash: confirmerSensorHash, platform: confirmerPlatform, geo: confirmerGeo, device_hash: confirmerDeviceHash, photo: confirmerPhoto, photo_hash: confirmerPhotoHash } = req.body;
+    const { act_sig: confirmerActSig, confirmed, device_ts: confirmerDeviceTs } = req.body;
 
     if (!validSessionCode(code)) {
       return res.status(400).json({ error: 'Invalid code format' });
@@ -2357,7 +1868,6 @@ app.post('/session/:code/confirm', (req, res) => {
       return res.status(400).json({ error: 'Missing confirmed field' });
     }
 
-    // Find session
     const me = db.exec('SELECT their_code FROM sessions WHERE my_code = ?', [code]);
     if (me.length === 0 || me[0].values.length === 0) {
       return res.status(404).json({ error: 'Session not found' });
@@ -2366,41 +1876,27 @@ app.post('/session/:code/confirm', (req, res) => {
     const sKey = sessionKey(code, theirCode);
     touchSession(code);
 
-    // Find proposal
     const proposal = db.exec(
-      'SELECT proposer_code, value, direction, description, category, duration, status, device_ts, sensor_hash, platform, geo, device_hash, proposer_photo, proposer_photo_hash, encrypted_exchange FROM session_proposals WHERE session_key = ?',
+      'SELECT proposer_code, status, encrypted_exchange, device_ts, act_hash, proposer_act_sig FROM session_proposals WHERE session_key = ?',
       [sKey]
     );
     if (proposal.length === 0 || proposal[0].values.length === 0) {
       return res.status(404).json({ error: 'No proposal found' });
     }
-
     const pr = proposal[0].values[0];
     if (pr[0] === code) {
       return res.status(400).json({ error: 'Cannot confirm your own proposal' });
     }
-    if (pr[6] !== 'pending') {
-      return res.status(409).json({ error: 'Proposal already ' + pr[6] });
+    if (pr[1] !== 'pending') {
+      return res.status(409).json({ error: 'Proposal already ' + pr[1] });
     }
 
     const now = Math.floor(Date.now() / 1000);
     const newStatus = confirmed ? 'confirmed' : 'rejected';
-
     db.run(
-      'UPDATE session_proposals SET status = ?, confirmer_desc = ?, confirmer_device_ts = ?, confirmer_sensor_hash = ?, confirmer_platform = ?, confirmer_geo = ?, confirmer_device_hash = ?, confirmer_photo = ?, confirmer_photo_hash = ?, resolved_at = ? WHERE session_key = ?',
-      [newStatus, confirmerDesc || '', confirmerDeviceTs || null, confirmerSensorHash || '', confirmerPlatform || '', confirmerGeo || '', confirmerDeviceHash || '', confirmerPhoto || '', confirmerPhotoHash || '', now, sKey]
+      'UPDATE session_proposals SET status = ?, confirmer_device_ts = ?, confirmer_act_sig = ?, resolved_at = ? WHERE session_key = ?',
+      [newStatus, Number.isFinite(confirmerDeviceTs) ? confirmerDeviceTs : null, (confirmed && confirmerActSig) ? confirmerActSig : '', now, sKey]
     );
-
-    if (confirmed && confirmerActSig) {
-      db.run('UPDATE session_proposals SET confirmer_act_sig = ? WHERE session_key = ?', [confirmerActSig, sKey]);
-    }
-
-    // Update presence
-    const fpRow = db.exec('SELECT fingerprint FROM sessions WHERE my_code = ?', [code]);
-    if (fpRow.length > 0 && fpRow[0].values.length > 0) {
-      updatePresence(fpRow[0].values[0][0], confirmerDeviceHash, 'session');
-    }
-
     saveDatabase();
     console.log(`[session] Proposal ${newStatus}: ${sKey}`);
 
@@ -2408,53 +1904,30 @@ app.post('/session/:code/confirm', (req, res) => {
       return res.json({ confirmed: false, status: 'rejected' });
     }
 
-    // Confirmed -- return all data both phones need to write their chains
-    const proposer = db.exec(
-      'SELECT fingerprint, public_key FROM sessions WHERE my_code = ?', [theirCode]
-    );
-    const confirmer = db.exec(
-      'SELECT fingerprint, public_key FROM sessions WHERE my_code = ?', [code]
-    );
-
-    const proposerData = proposer[0].values[0];
-    const confirmerData = confirmer[0].values[0];
-    const actRow = db.exec('SELECT act_hash, proposer_act_sig FROM session_proposals WHERE session_key = ?', [sKey]);
-    const actHash = (actRow.length && actRow[0].values.length) ? (actRow[0].values[0][0] || '') : '';
-    const proposerActSig = (actRow.length && actRow[0].values.length) ? (actRow[0].values[0][1] || '') : '';
+    // Confirmed: return what both phones need to write their chains.
+    const proposerData = db.exec('SELECT fingerprint, public_key FROM sessions WHERE my_code = ?', [theirCode])[0].values[0];
+    const confirmerData = db.exec('SELECT fingerprint, public_key FROM sessions WHERE my_code = ?', [code])[0].values[0];
 
     res.json({
       confirmed: true,
       status: 'confirmed',
-      proposal: {
-        value: pr[1],
-        direction: pr[2],
-        description: pr[3],
-        category: pr[4],
-        duration: pr[5],
-        device_ts: pr[7] || null,
-        sensor_hash: pr[8] || '',
-        platform: pr[9] || '',
-        geo: pr[10] || '',
-        encrypted_exchange: pr[14] || '',
-        act_hash: actHash,
-        proposer_act_sig: proposerActSig,
+      proposal: Object.assign({}, PROPOSAL_PLACEHOLDERS, {
+        device_ts: pr[3] || null,
+        encrypted_exchange: pr[2] || '',
+        act_hash: pr[4] || '',
+        proposer_act_sig: pr[5] || '',
         confirmer_act_sig: confirmerActSig || '',
-      },
+      }),
       proposer: {
         code: theirCode,
         fingerprint: proposerData[0],
         public_key: JSON.parse(proposerData[1]),
-        act_sig: proposerActSig,
-        device_hash: pr[11] || '',
-        photo: pr[12] || '',
-        photo_hash: pr[13] || '',
+        act_sig: pr[5] || '',
       },
       confirmer: {
         code: code,
         fingerprint: confirmerData[0],
         public_key: JSON.parse(confirmerData[1]),
-        description: confirmerDesc || '',
-        device_hash: confirmerDeviceHash || '',
       },
     });
   } catch (e) {
@@ -2532,12 +2005,12 @@ function uniqueOwnerCode() {
 // --- POST /pipe ---
 // Inviter opens a pipe. Body: { pipe_code, fingerprint, public_key,
 // name?, max_redemptions? } (1 = single invite, 0 = uncapped room).
-app.post('/pipe', (req, res) => {
+app.post('/pipe', allow(['pipe_code', 'fingerprint', 'public_key', 'max_redemptions']), (req, res) => {
   try {
     const shapeError = validatePipeCreateShape(req.body);
     if (shapeError) return res.status(400).json({ error: shapeError });
 
-    const { pipe_code, fingerprint, public_key, name } = req.body;
+    const { pipe_code, fingerprint, public_key } = req.body;
     const cap = req.body.max_redemptions === undefined ? 1 : req.body.max_redemptions;
     const now = Math.floor(Date.now() / 1000);
 
@@ -2549,8 +2022,8 @@ app.post('/pipe', (req, res) => {
     }
 
     db.run(
-      'INSERT INTO pipes (pipe_code, owner_fingerprint, owner_public_key, owner_name, max_redemptions, redemption_count, closed, created_at) VALUES (?, ?, ?, ?, ?, 0, 0, ?)',
-      [pipe_code, fingerprint, JSON.stringify(public_key), name || null, cap, now]
+      'INSERT INTO pipes (pipe_code, owner_fingerprint, owner_public_key, max_redemptions, redemption_count, closed, created_at) VALUES (?, ?, ?, ?, 0, 0, ?)',
+      [pipe_code, fingerprint, JSON.stringify(public_key), cap, now]
     );
     saveDatabase();
     console.log(`[pipe] Opened: ${pipe_code} (cap ${cap === 0 ? 'uncapped' : cap})`);
@@ -2566,23 +2039,23 @@ app.post('/pipe', (req, res) => {
 // Response introduces the owner and a server-generated owner-side
 // session code for this pairing, so the redeemer can immediately
 // join the normal session machinery. Idempotent per redeemer.
-app.post('/pipe/:code/redeem', (req, res) => {
+app.post('/pipe/:code/redeem', allow(['redeemer_code', 'fingerprint', 'public_key']), (req, res) => {
   try {
     const pipeCode = req.params.code;
     if (!validPipeCode(pipeCode)) return res.status(400).json({ error: 'Invalid pipe code' });
     const shapeError = validatePipeRedeemShape(req.body);
     if (shapeError) return res.status(400).json({ error: shapeError });
 
-    const { redeemer_code, fingerprint, public_key, name } = req.body;
+    const { redeemer_code, fingerprint, public_key } = req.body;
 
     const pipeRows = db.exec(
-      'SELECT owner_fingerprint, owner_public_key, owner_name, max_redemptions, redemption_count, closed, created_at FROM pipes WHERE pipe_code = ?',
+      'SELECT owner_fingerprint, owner_public_key, max_redemptions, redemption_count, closed, created_at FROM pipes WHERE pipe_code = ?',
       [pipeCode]
     );
     if (pipeRows.length === 0 || pipeRows[0].values.length === 0) {
       return res.status(404).json({ accepted: false, reason: 'not_found' });
     }
-    const [ownerFp, ownerKey, ownerName, cap, count, closed, createdAt] = pipeRows[0].values[0];
+    const [ownerFp, ownerKey, cap, count, closed, createdAt] = pipeRows[0].values[0];
     // Same-owner rule (v2.9.0): redeeming a pipe your own chain opened.
     if (ownerFp && fingerprint === ownerFp) {
       return res.json({ accepted: false, reason: 'same_chain' });
@@ -2603,7 +2076,7 @@ app.post('/pipe/:code/redeem', (req, res) => {
       return res.json({
         accepted: true,
         owner_code: prior[0].values[0][0],
-        owner: { name: ownerName || '', public_key: ownerKey ? JSON.parse(ownerKey) : null, fingerprint: ownerFp },
+        owner: { public_key: ownerKey ? JSON.parse(ownerKey) : null, fingerprint: ownerFp },
       });
     }
 
@@ -2615,8 +2088,8 @@ app.post('/pipe/:code/redeem', (req, res) => {
     if (!ownerCode) return res.status(500).json({ error: 'Could not allocate code' });
 
     db.run(
-      'INSERT INTO pipe_redemptions (pipe_code, redeemer_code, owner_code, redeemer_fingerprint, redeemer_public_key, redeemer_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [pipeCode, redeemer_code, ownerCode, fingerprint, JSON.stringify(public_key), name || null, now]
+      'INSERT INTO pipe_redemptions (pipe_code, redeemer_code, owner_code, redeemer_fingerprint, redeemer_public_key, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [pipeCode, redeemer_code, ownerCode, fingerprint, JSON.stringify(public_key), now]
     );
     db.run('UPDATE pipes SET redemption_count = redemption_count + 1 WHERE pipe_code = ?', [pipeCode]);
     saveDatabase();
@@ -2625,7 +2098,7 @@ app.post('/pipe/:code/redeem', (req, res) => {
     res.json({
       accepted: true,
       owner_code: ownerCode,
-      owner: { name: ownerName || '', public_key: ownerKey ? JSON.parse(ownerKey) : null, fingerprint: ownerFp },
+      owner: { public_key: ownerKey ? JSON.parse(ownerKey) : null, fingerprint: ownerFp },
     });
   } catch (e) {
     console.error('[pipe] REDEEM error:', e.message);
@@ -2633,17 +2106,17 @@ app.post('/pipe/:code/redeem', (req, res) => {
   }
 });
 
-// --- GET /pipe/:code/owner ---
+// --- POST /pipe/:code/owner (v2.10.0), GET /pipe/:code/owner (older apps) ---
 // Inviter polls for redemptions. Requires the owner fingerprint so a
-// bystander who can see the QR cannot enumerate who redeemed. Bearer
-// strength matches the rest of the session layer; the per-record
-// signature downstream is the real gate.
-app.get('/pipe/:code/owner', (req, res) => {
+// bystander who can see the QR cannot enumerate who redeemed. v2.10.0
+// moves the fingerprint into a POST body so it stays out of URLs and
+// access logs; the GET form stays for production v2.99.3 until it is
+// promoted past, then goes.
+function pipeOwnerPoll(req, res, fingerprint) {
   try {
     const pipeCode = req.params.code;
     if (!validPipeCode(pipeCode)) return res.status(400).json({ error: 'Invalid pipe code' });
-    const fingerprint = req.query.fingerprint;
-    if (!fingerprint) return res.status(400).json({ error: 'Missing fingerprint' });
+    if (!fingerprint || typeof fingerprint !== 'string') return res.status(400).json({ error: 'Missing fingerprint' });
 
     const pipeRows = db.exec(
       'SELECT owner_fingerprint, max_redemptions, redemption_count, closed FROM pipes WHERE pipe_code = ?',
@@ -2656,7 +2129,7 @@ app.get('/pipe/:code/owner', (req, res) => {
     if (ownerFp !== fingerprint) return res.status(403).json({ error: 'Not the pipe owner' });
 
     const rows = db.exec(
-      'SELECT redeemer_code, owner_code, redeemer_fingerprint, redeemer_public_key, redeemer_name, created_at FROM pipe_redemptions WHERE pipe_code = ? ORDER BY created_at ASC',
+      'SELECT redeemer_code, owner_code, redeemer_fingerprint, redeemer_public_key, created_at FROM pipe_redemptions WHERE pipe_code = ? ORDER BY created_at ASC',
       [pipeCode]
     );
     const redemptions = (rows.length > 0 ? rows[0].values : []).map(r => ({
@@ -2664,21 +2137,21 @@ app.get('/pipe/:code/owner', (req, res) => {
       owner_code: r[1],
       fingerprint: r[2],
       public_key: r[3] ? JSON.parse(r[3]) : null,
-      name: r[4] || '',
-      created_at: r[5],
+      created_at: r[4],
     }));
-
     res.json({ found: true, closed: !!closed, max_redemptions: cap, redemption_count: count, redemptions });
   } catch (e) {
     console.error('[pipe] OWNER POLL error:', e.message);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
+app.post('/pipe/:code/owner', allow(['fingerprint']), (req, res) => pipeOwnerPoll(req, res, req.body.fingerprint));
+app.get('/pipe/:code/owner', (req, res) => pipeOwnerPoll(req, res, req.query.fingerprint));
 
 // --- POST /pipe/:code/close ---
 // Inviter closes the pipe. Redemptions already made stay valid; their
 // sessions proceed normally.
-app.post('/pipe/:code/close', (req, res) => {
+app.post('/pipe/:code/close', allow(['fingerprint']), (req, res) => {
   try {
     const pipeCode = req.params.code;
     if (!validPipeCode(pipeCode)) return res.status(400).json({ error: 'Invalid pipe code' });
@@ -2727,7 +2200,7 @@ async function start() {
     db.run('DELETE FROM peers WHERE url = ?', [selfClean]);
     db.run(
       'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [selfClean, serverKeys.publicKeyHex, VERSION, witnessedCount, now, now]
+      [selfClean, serverKeys.publicKeyHex, VERSION, 0, now, now]
     );
     saveDatabase();
     console.log(`[gossip] Self-registered as: ${selfClean}`);
@@ -2763,11 +2236,9 @@ async function start() {
     console.log(`[server] Listening on port ${PORT}`);
     console.log(`[server] Endpoints:`);
     console.log(`         POST /witness     submit mint for attestation`);
-    console.log(`         POST /ping        proof-of-human heartbeat attestation`);
+    console.log(`         POST /ping        heartbeat attestation (signs head_hash; stores nothing)`);
     console.log(`         PUT  /relay/:id   deposit settlement`);
     console.log(`         GET  /relay/:id   retrieve settlement`);
-    console.log(`         POST /pair        submit pairing code half`);
-    console.log(`         GET  /pair/check/:code check pair resolution`);
     console.log(`         POST /session/join     join a session`);
     console.log(`         GET  /session/:code    poll session state`);
     console.log(`         POST /session/:code/thread  push thread snapshot`);
@@ -2779,7 +2250,8 @@ async function start() {
     console.log(`         GET  /peers       list active servers`);
     console.log(`         POST /update      signed self-update broadcast`);
     console.log(`         GET  /status      health check`);
-    console.log(`         GET  /stats       public-facing aggregate counts`);
+    console.log(`         GET  /stats       version, uptime, peer count`);
+    console.log(`         request allowlist: on (unlisted fields dropped before writing)`);
     console.log('');
 
     // Initial heartbeat after startup (give server 2 seconds to settle)
