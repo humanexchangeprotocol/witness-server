@@ -110,7 +110,7 @@ async function main() {
   const st = await (await fetch(BASE + '/status')).json();
   check('/status has no witnessed_total', st.witnessed_total === undefined);
   check('/status has no active_sessions', st.active_sessions === undefined);
-  check('/status keeps pubkey and version', typeof st.server_pubkey === 'string' && st.version === '2.10.0');
+  check('/status keeps pubkey and version', typeof st.server_pubkey === 'string' && st.version === '2.11.0');
   const pubkey = Buffer.from(st.server_pubkey, 'hex');
 
   console.log('\n3. Sealed session with extra clear fields');
@@ -172,6 +172,23 @@ async function main() {
   r = await post('/pipe/QRTUVWXYZA/owner', { fingerprint: 'someone-else' });
   check('owner poll refuses a non-owner', r.status === 403);
   check('owner poll by GET still works for older apps', (await fetch(BASE + '/pipe/QRTUVWXYZA/owner?fingerprint=fpO')).ok);
+
+  console.log('\n5b. Session keys (v2.11.0): stored, returned, no code oracle, join rate limit');
+  const skA = { kty: 'EC', crv: 'P-256', x: 'x'.repeat(43), y: 'y'.repeat(43) }, skB = { kty: 'EC', crv: 'P-256', x: 'a'.repeat(43), y: 'b'.repeat(43) };
+  r = await post('/session/join', { my_code: 'KLMN', their_code: 'PQRS', fingerprint: 'fpA', public_key: kA, session_key: skA, session_sig: 'sigA', extra_clear: 'NAMECANARY' });
+  check('join with session key accepted', r.ok);
+  r = await post('/session/join', { my_code: 'PQRS', their_code: 'KLMN', fingerprint: 'fpB', public_key: kB, session_key: skB, session_sig: 'sigB' });
+  j = await r.json();
+  check('partner carries session_key and session_sig', j.connected && j.partner.session_key && j.partner.session_key.x === skA.x && j.partner.session_sig === 'sigA');
+  r = await fetch(BASE + '/session/KLMN'); j = await r.json();
+  check('poll carries the partner session key', j.connected && j.partner.session_key && j.partner.session_key.y === skB.y && j.partner.session_sig === 'sigB');
+  r = await fetch(BASE + '/session/ZZZZ'); j = await r.json();
+  check('unknown code answers like an open one (no oracle)', r.status === 200 && j.found === true && j.connected === false);
+  r = await post('/session/join', { my_code: 'KLMN', their_code: 'PQRS', fingerprint: 'fpA', public_key: kA, session_key: { x: 5 }, session_sig: 'sigA' });
+  check('malformed session key refused', r.status === 400);
+  let limited = false;
+  for (let i = 0; i < 70; i++) { const c = 'R' + String.fromCharCode(65 + (i % 26)) + String.fromCharCode(65 + Math.floor(i / 26)) + 'T'; const rr = await post('/session/join', { my_code: c, their_code: 'ZZZA', fingerprint: 'fpX', public_key: kA }); if (rr.status === 429) { limited = true; break; } }
+  check('joins rate limited per address', limited);
 
   console.log('\n6. Nothing planted reached the database');
   await new Promise(r => setTimeout(r, 1300)); // saveDatabase runs on writes; give the last one a moment

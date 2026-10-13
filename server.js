@@ -23,6 +23,7 @@ const STATE_PATH = process.env.HCP_STATE || path.join(__dirname, 'server_state.j
 const MINT_RETENTION_HOURS = 6; // idempotent re-witness window only
 const RELAY_RETENTION_HOURS = 72;
 const SESSION_RETENTION_HOURS = 2; // v2.10.0: sessions are ephemeral, two hours max
+const SESSION_OPEN_MINUTES = 10; // v2.11.0: a session with no partner is dropped after this
 const PIPE_RETENTION_HOURS = 24; // Invite pipes are ephemeral, 24 hour max (matches sessions)
 const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -35,7 +36,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.10.0';
+const VERSION = '2.11.0';
 
 let db = null;
 let serverKeys = null;
@@ -402,9 +403,15 @@ async function initDatabase() {
       fingerprint TEXT NOT NULL,
       public_key TEXT NOT NULL,
       encrypted_snapshot TEXT,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      session_key TEXT,
+      session_sig TEXT
     )
   `);
+  // v2.11.0: a fresh per-session key and its signature by the phone's signing
+  // key (public material, already on the allowlist as keys and signatures).
+  try { db.run('ALTER TABLE sessions ADD COLUMN session_key TEXT'); } catch(e) {}
+  try { db.run('ALTER TABLE sessions ADD COLUMN session_sig TEXT'); } catch(e) {}
 
   db.run(`
     CREATE TABLE IF NOT EXISTS session_proposals (
@@ -510,7 +517,7 @@ function saveDatabase() {
 // removed values do not linger in free pages of the database file.
 const MINIMAL_COLUMNS = {
   witnessed_mints: ['mint_hash', 'device_ts', 'server_ts', 'server_sig', 'act_hash', 'created_at'],
-  sessions: ['my_code', 'their_code', 'fingerprint', 'public_key', 'encrypted_snapshot', 'created_at'],
+  sessions: ['my_code', 'their_code', 'fingerprint', 'public_key', 'encrypted_snapshot', 'created_at', 'session_key', 'session_sig'],
   session_proposals: ['session_key', 'proposer_code', 'status', 'encrypted_exchange', 'act_hash', 'proposer_act_sig', 'confirmer_act_sig', 'device_ts', 'confirmer_device_ts', 'created_at', 'resolved_at'],
   pipes: ['pipe_code', 'owner_fingerprint', 'owner_public_key', 'max_redemptions', 'redemption_count', 'closed', 'created_at'],
   pipe_redemptions: ['pipe_code', 'redeemer_code', 'owner_code', 'redeemer_fingerprint', 'redeemer_public_key', 'created_at'],
@@ -584,6 +591,9 @@ function runCleanup() {
   // Expired sessions (ephemeral, SESSION_RETENTION_HOURS max)
   const sessionCutoff = now - (SESSION_RETENTION_HOURS * 60 * 60);
   db.run('DELETE FROM sessions WHERE created_at < ?', [sessionCutoff]);
+  // v2.11.0: a session nobody joined expires in SESSION_OPEN_MINUTES, which
+  // shortens the window in which its code could be guessed.
+  db.run('DELETE FROM sessions WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM sessions p WHERE p.my_code = sessions.their_code AND p.their_code = sessions.my_code)', [now - SESSION_OPEN_MINUTES * 60]);
   db.run('DELETE FROM session_proposals WHERE created_at < ?', [sessionCutoff]);
   pruneSessionMemory(sessionCutoff * 1000);
   // Expired invite pipes and their redemption rows (24 hours max)
@@ -1612,19 +1622,49 @@ function partnerView(row) {
     fingerprint: row[0],
     public_key: row[1] ? JSON.parse(row[1]) : null,
     encrypted_snapshot: row[2] || null,
+    session_key: row[3] ? JSON.parse(row[3]) : null,
+    session_sig: row[4] || null,
   };
+}
+const PARTNER_COLS = 'fingerprint, public_key, encrypted_snapshot, session_key, session_sig';
+
+// v2.11.0: joins are rate limited per address, in memory only, nothing written
+// or logged. A 4-letter code has 456,976 values; this makes guessing one an
+// open session's code impractical from one address. Honest phones join once
+// per session.
+const JOIN_WINDOW_MS = 10 * 60 * 1000, JOIN_MAX = 60;
+const joinHits = new Map();
+function clientAddr(req) {
+  const xf = req.headers['x-forwarded-for'];
+  const a = (xf ? String(xf).split(',')[0].trim() : (req.ip || (req.socket && req.socket.remoteAddress) || '')).replace(/^::ffff:/, '');
+  return a || 'unknown';
+}
+function joinAllowed(req) {
+  const now = Date.now(), a = clientAddr(req);
+  const hits = (joinHits.get(a) || []).filter(t => now - t < JOIN_WINDOW_MS);
+  if (hits.length >= JOIN_MAX) { joinHits.set(a, hits); return false; }
+  hits.push(now); joinHits.set(a, hits);
+  if (joinHits.size > 10000) for (const [k, v] of joinHits) if (!v.length || now - v[v.length - 1] > JOIN_WINDOW_MS) joinHits.delete(k);
+  return true;
 }
 
 // --- POST /session/join ---
 // Phone joins a session with its code, its partner's code and its key.
 // v2.10.0: no plaintext snapshot and no role on the join; anything the
 // other phone needs travels in the encrypted snapshot.
-app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public_key']), (req, res) => {
+app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public_key', 'session_key', 'session_sig']), (req, res) => {
   try {
-    const { my_code, their_code, fingerprint, public_key } = req.body;
+    const { my_code, their_code, fingerprint, public_key, session_key, session_sig } = req.body;
 
     if (!my_code || !their_code || !fingerprint || !public_key) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (!joinAllowed(req)) return res.status(429).json({ error: 'Too many joins. Wait a few minutes.' });
+    if (session_key && (typeof session_key !== 'object' || typeof session_key.x !== 'string' || typeof session_key.y !== 'string' || session_key.x.length > 64 || session_key.y.length > 64)) {
+      return res.status(400).json({ error: 'Invalid session key' });
+    }
+    if (session_sig && (typeof session_sig !== 'string' || session_sig.length > 256)) {
+      return res.status(400).json({ error: 'Invalid session signature' });
     }
     if (!validSessionCode(my_code) || !validSessionCode(their_code)) {
       return res.status(400).json({ error: 'Invalid code format' });
@@ -1639,15 +1679,15 @@ app.post('/session/join', allow(['my_code', 'their_code', 'fingerprint', 'public
     const existing = db.exec('SELECT my_code FROM sessions WHERE my_code = ?', [my_code]);
     if (existing.length === 0 || existing[0].values.length === 0) {
       db.run(
-        'INSERT INTO sessions (my_code, their_code, fingerprint, public_key, created_at) VALUES (?, ?, ?, ?, ?)',
-        [my_code, their_code, fingerprint, JSON.stringify(public_key), now]
+        'INSERT INTO sessions (my_code, their_code, fingerprint, public_key, created_at, session_key, session_sig) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [my_code, their_code, fingerprint, JSON.stringify(public_key), now, session_key ? JSON.stringify({ kty: session_key.kty || 'EC', crv: session_key.crv || 'P-256', x: session_key.x, y: session_key.y }) : null, session_sig || null]
       );
       console.log(`[session] Joined: ${my_code} -> ${their_code}`);
       saveDatabase();
     }
 
     const partner = db.exec(
-      'SELECT fingerprint, public_key, encrypted_snapshot FROM sessions WHERE my_code = ? AND their_code = ?',
+      'SELECT ' + PARTNER_COLS + ' FROM sessions WHERE my_code = ? AND their_code = ?',
       [their_code, my_code]
     );
     if (partner.length > 0 && partner[0].values.length > 0) {
@@ -1672,13 +1712,15 @@ app.get('/session/:code', (req, res) => {
 
     const me = db.exec('SELECT their_code FROM sessions WHERE my_code = ?', [code]);
     if (me.length === 0 || me[0].values.length === 0) {
-      return res.status(404).json({ found: false });
+      // v2.11.0: an unknown code answers like an open one still waiting, so this
+      // endpoint cannot be used to find open sessions by trying codes.
+      return res.json({ found: true, connected: false });
     }
     const theirCode = me[0].values[0][0];
     touchSession(code);
 
     const partner = db.exec(
-      'SELECT fingerprint, public_key, encrypted_snapshot FROM sessions WHERE my_code = ? AND their_code = ?',
+      'SELECT ' + PARTNER_COLS + ' FROM sessions WHERE my_code = ? AND their_code = ?',
       [theirCode, code]
     );
     const connected = partner.length > 0 && partner[0].values.length > 0;
