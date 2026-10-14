@@ -110,7 +110,7 @@ async function main() {
   const st = await (await fetch(BASE + '/status')).json();
   check('/status has no witnessed_total', st.witnessed_total === undefined);
   check('/status has no active_sessions', st.active_sessions === undefined);
-  check('/status keeps pubkey and version', typeof st.server_pubkey === 'string' && st.version === '2.13.0');
+  check('/status keeps pubkey and version', typeof st.server_pubkey === 'string' && st.version === '2.13.1');
   const pubkey = Buffer.from(st.server_pubkey, 'hex');
 
   console.log('\n3. Sealed session with extra clear fields');
