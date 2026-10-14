@@ -36,7 +36,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.13.1';
+const VERSION = '2.13.2';
 
 let db = null;
 let serverKeys = null;
@@ -1494,7 +1494,7 @@ async function heartbeat() {
     }
   });
 
-  if (peers.length === 0 && seedTargets.length === 0) return;
+  if (peers.length === 0 && seedTargets.length === 0) return { signed: 0, legacy: 0 };
 
   let signedCount = 0;
   let legacyCount = 0;
@@ -1538,6 +1538,7 @@ async function heartbeat() {
     await announceToServer(target);
   }
   console.log(`[gossip] Heartbeat: ${signedCount} signed + ${legacyCount} legacy`);
+  return { signed: signedCount, legacy: legacyCount };
 }
 
 // --- GET /status ---
@@ -2362,9 +2363,22 @@ async function start() {
     console.log(`         request allowlist: on (unlisted fields dropped before writing)`);
     console.log('');
 
-    // Initial heartbeat after startup (give server 2 seconds to settle)
+    // Initial heartbeat after startup (give server 2 seconds to settle).
+    // v2.13.2: a new witness knows no peer pubkeys yet, so its first
+    // heartbeat goes out legacy; the replies teach it the keys, but only
+    // a signed announce gets it into a peer's signed /peers list, and the
+    // next regular heartbeat is HEARTBEAT_INTERVAL_MS away (15 min). So
+    // when the first heartbeat sent anything legacy, send one follow-up
+    // 30 s later, which is signed for every peer whose key arrived.
+    // Timing only: nothing new is sent or stored.
     if (SELF_URL) {
-      setTimeout(heartbeat, 2000);
+      setTimeout(async () => {
+        const first = await heartbeat().catch(() => null);
+        if (first && first.legacy > 0) {
+          console.log('[gossip] First heartbeat was partly legacy; a signed follow-up goes out in 30 s');
+          setTimeout(() => heartbeat().catch(() => {}), 30 * 1000);
+        }
+      }, 2000);
     }
   });
 }

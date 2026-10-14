@@ -291,7 +291,7 @@ Note that the domain in this case is a convenience for clients, not part of the 
 
 Phones trust the witnesses in the app's seed list (`HEP_SEEDS`) and any a person adds by hand. Since app v2.142.0 a phone can also learn your witness through gossip:
 
-1. Set `HCP_SEEDS` to one or more network witnesses (for example `https://witness.thesitefit.com`). Your witness announces itself to them with a signed message, they check it can be reached at the name you announced, and they list you in their signed peer list.
+1. Set `HCP_SEEDS` to one or more network witnesses (for example `https://witness.thesitefit.com`). Your witness announces itself to them with a signed message, they check it can be reached at the name you announced, and they list you in their signed peer list. A fresh witness does this in about half a minute: its first announce goes out before it knows their keys, and a signed follow-up goes out 30 seconds later.
 2. When someone who trusts your witness starts an exchange on it, the code they show begins with your witness's street (two letters drawn from your public key).
 3. A stranger's phone that does not know that street asks the witnesses it trusts for their signed peer lists, checks each signature, finds your street, and confirms your key at `/status` before joining.
 
