@@ -253,20 +253,25 @@ Adjust paths to match your install. The backup directory can be deleted after a 
 
 Local-network operation is fully supported and is the default. This section covers what changes when you want users outside your local network to reach the witness.
 
-The witness is identified by its public key, not by a domain name. A domain name is one way to give clients a stable hostname, but it is not part of the trust model and not required to operate a public witness.
+The witness is identified by its public key, not by a domain name. The name is not part of the trust model, but phones can only reach a witness that has one (see below).
 
-### Option A: opened router port (no domain required)
+### What phones need: a name with a certificate
 
-The simplest public-internet path. Open one TCP port on your home router and forward it to the machine running the witness. Users reach the witness at your public IP and that port.
+The HEP app is a web page served over HTTPS, and a browser on an HTTPS page will only call addresses that are also HTTPS. So for phones to reach your witness, it must answer at `https://<a name>` on port 443 with a valid certificate. A bare IP, or any other port, works for other witnesses but not for phones.
 
-Steps:
+Tell the witness the name it is reachable at, and it will announce that name in signed gossip:
 
-1. Pick a port on your router. Port 3141 is fine if you have only one witness behind that router; otherwise pick any unused port.
-2. In your router's admin UI, add a port-forward rule: external port (your pick) -> internal IP (the witness machine) -> internal port (3141 unless changed via `HCP_PORT`).
-3. If your home IP is dynamic (most residential connections are), set up a dynamic DNS hostname so users have a stable address. Free DDNS providers like duckdns.org are sufficient. The hostname is for client convenience; the trust anchor is still your pubkey.
-4. If a firewall on the witness machine is active, allow inbound on the witness's listening port (default 3141).
+```
+HCP_PUBLIC_IP=yourname.duckdns.org
+HCP_PUBLIC_PORT=443
+HCP_URL=https://yourname.duckdns.org
+```
 
-The witness does not need to know its own public IP for this option. Clients reaching it from outside arrive on the same listening port the witness already has open. Test by visiting `http://<your-ddns-hostname>:<external-port>/status` from a phone on cellular data (not on your home wifi).
+`HCP_PUBLIC_IP` takes a name, not only an IP; the setting kept its old label. With port 443 the network describes you as `https://yourname.duckdns.org`.
+
+### Option A: opened router port with a free name
+
+Open port 443 on your home router and forward it to the machine running the witness. Get a free dynamic DNS name (duckdns.org works) so the name follows your home IP. Then put a small TLS front in front of the witness on that machine: Caddy gets and renews a Let's Encrypt certificate for the name by itself, and proxies to `127.0.0.1:3141`. Test by opening `https://yourname.duckdns.org/status` from a phone on cellular data (not your home wifi). If the page shows your `server_pubkey`, phones can reach you.
 
 ### Option B: reverse proxy with TLS (for operators who already run a web server)
 
@@ -284,9 +289,15 @@ Note that the domain in this case is a convenience for clients, not part of the 
 
 ### Becoming reachable to users in the wild
 
-A new public witness is not automatically known to client apps. Today the app holds a hard-coded seed list of trusted witness pubkeys (`HEP_SEEDS` in the app source). To be reached by users, your witness's pubkey needs to be added to that list.
+Phones trust the witnesses in the app's seed list (`HEP_SEEDS`) and any a person adds by hand. Since app v2.142.0 a phone can also learn your witness through gossip:
 
-The path to seed-list inclusion is not self-service yet. Architectural decisions about the bootstrap signing key are still open. If you have stood up a witness and want to be added to the network, open an issue on this repo with your pubkey and a brief description of your hosting setup.
+1. Set `HCP_SEEDS` to one or more network witnesses (for example `https://witness.thesitefit.com`). Your witness announces itself to them with a signed message, they check it can be reached at the name you announced, and they list you in their signed peer list.
+2. When someone who trusts your witness starts an exchange on it, the code they show begins with your witness's street (two letters drawn from your public key).
+3. A stranger's phone that does not know that street asks the witnesses it trusts for their signed peer lists, checks each signature, finds your street, and confirms your key at `/status` before joining.
+
+What a learned witness may do: carry that one exchange. It is not added to the stranger's trust set, it is not stored, and it never attests the record (attestation goes to the phone's own configured witness). Every check that protects an exchange from a hostile witness still applies to it.
+
+Getting into the seed list itself is not self-service yet. If you have stood up a witness and want to be considered, open an issue on this repo with your pubkey and a brief description of your hosting setup.
 
 ---
 
@@ -316,7 +327,7 @@ All env vars are optional. The witness runs with reasonable defaults.
 | `HCP_DB` | `./witness.db` | Path to the SQLite database file. |
 | `HCP_KEY` | `./server_key.json` | Path to the signing key file. |
 | `HCP_STATE` | `./server_state.json` | Path to the sequence counter file. |
-| `HCP_PUBLIC_IP` | (unset) | Public IP this witness announces itself at in signed gossip. Set when running on the public internet via an opened router port. |
+| `HCP_PUBLIC_IP` | (unset) | Public name (or IP) this witness announces itself at in signed gossip. For phones to reach you it must be a name with a certificate, with `HCP_PUBLIC_PORT=443`. |
 | `HCP_PUBLIC_PORT` | falls back to `HCP_PORT` | Public port this witness announces. Set if external port and internal port differ. |
 | `HCP_URL` | (unset) | Legacy public URL announcement field. Used by older clients. Optional. |
 | `HCP_SEEDS` | (empty) | Comma-separated list of seed peer URLs to attempt at startup. Used by witnesses that want to join an existing peer network. |
