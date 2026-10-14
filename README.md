@@ -59,6 +59,8 @@ The same applies to `witness.db` (the attestation database) and `server_state.js
 
 ## Step-by-step install on Raspberry Pi OS
 
+Before you buy or set up anything: a Pi at home is only useful as a witness if your home connection has a real public address of its own and you can forward ports on your router. Connections behind CGNAT (common on mobile, 5G home and some fiber plans) cannot be reached from outside. Check first; see "Becoming reachable" and Option A below, or the Host a server page on humanexchangeprotocol.org. If your connection fails that check, a small rented VPS is the path.
+
 This walks through a clean install on Raspberry Pi OS Bookworm. The same commands work on Ubuntu, Debian, and other Debian-derived systems. On non-Debian Linux, substitute your package manager for `apt`.
 
 If your Pi has both wired and wireless options available, ethernet is the more reliable first-boot path. Pi Imager's wifi customization has been observed to silently fail to apply on some installs; ethernet has been reliable on the same hardware. Once the Pi is running and reachable, wifi can be configured directly on the device.
