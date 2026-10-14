@@ -36,7 +36,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.12.0';
+const VERSION = '2.13.0';
 
 let db = null;
 let serverKeys = null;
@@ -102,7 +102,7 @@ function loadOrCreateState() {
 
 function persistState() {
   serverState.updated = new Date().toISOString();
-  fs.writeFileSync(STATE_PATH, JSON.stringify(serverState, null, 2));
+  writeFileAtomic(STATE_PATH, JSON.stringify(serverState, null, 2)); // v2.13.0: never half-written
 }
 
 function nextSequence() {
@@ -496,19 +496,44 @@ async function initDatabase() {
   // the async probe. Filtered to reachable=1 in getActivePeersSigned.
   try { db.run('ALTER TABLE peers ADD COLUMN reachable INTEGER'); } catch(e) {}
 
-  saveDatabase();
+  saveDatabaseNow(); // v2.13.0: the startup migration lands at once
   console.log('[db] Tables ready (minimal shapes, v2.10.0)');
 }
 
-function saveDatabase() {
+// v2.13.0: the write path. Writes go to a temp file that is then renamed over the old
+// one, so a crash mid-write can never leave a half-written database (rename is atomic on
+// the same filesystem). Saves are grouped: a burst of changes inside SAVE_COALESCE_MS
+// becomes one write instead of one per change. Honest limit: a crash loses at most that
+// window; open sessions are retried by the phones and attestations are re-requested, so
+// nothing on a person's chain depends on it. A shutdown signal (pm2 restart) flushes first.
+// The full fix for a busy witness (a file-backed engine writing row by row) stays pinned.
+const SAVE_COALESCE_MS = 1000;
+let _saveTimer = null;
+function writeFileAtomic(path, data) {
+  const tmp = path + '.tmp';
+  const fd = fs.openSync(tmp, 'w');
+  try { fs.writeSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fs.renameSync(tmp, path);
+}
+function saveDatabaseNow() {
+  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   try {
-    const data = db.export();
-    const buffer = Buffer.from(data);
-    fs.writeFileSync(DB_PATH, buffer);
+    writeFileAtomic(DB_PATH, Buffer.from(db.export()));
   } catch (e) {
     console.error('[db] Save error:', e.message);
   }
 }
+function saveDatabase() {
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(saveDatabaseNow, SAVE_COALESCE_MS);
+}
+function flushAndExit(sig) {
+  console.log('[db] ' + sig + ': saving before exit');
+  try { if (db) saveDatabaseNow(); } catch (e) { console.error('[db] Final save failed:', e.message); }
+  process.exit(0);
+}
+process.on('SIGINT', () => flushAndExit('SIGINT'));
+process.on('SIGTERM', () => flushAndExit('SIGTERM'));
 
 // === MIGRATION TO MINIMAL SHAPES (v2.10.0) ===
 // Keeps only allowlisted columns. A table is rebuilt when it carries any
