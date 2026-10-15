@@ -297,7 +297,9 @@ Phones trust the witnesses in the app's seed list (`HEP_SEEDS`) and any a person
 2. When someone who trusts your witness starts an exchange on it, the code they show begins with your witness's street (two letters drawn from your public key).
 3. A stranger's phone that does not know that street asks the witnesses it trusts for their signed peer lists, checks each signature, finds your street, and confirms your key at `/status` before joining.
 
-What a learned witness may do: carry that one exchange. It is not added to the stranger's trust set, it is not stored, and it never attests the record (attestation goes to the phone's own configured witness). Every check that protects an exchange from a hostile witness still applies to it.
+What a learned witness may do: carry exchanges. It is not added to the stranger's trust set and it never attests the record (attestation goes to a witness the phone trusts). Every check that protects an exchange from a hostile witness still applies to it. From app v2.143.0 a phone also saves a few learned witnesses as carriers, so it can still start and join exchanges if the witnesses it trusts are taken down.
+
+Flood limits (witness v2.14.0): a witness lists at most 256 peers and at most 3 from the same owner (one registrable domain name; a free name service such as DuckDNS counts as one owner with 16 places; a bare IP is its own owner). Running many witnesses under one name does not earn more places. Phones apply similar limits to their own saved list. If your witness is refused with "peer limit reached", the seed already lists as many witnesses from your domain or name service as it allows.
 
 Getting into the seed list itself is not self-service yet. If you have stood up a witness and want to be considered, open an issue on this repo with your pubkey and a brief description of your hosting setup.
 
@@ -333,6 +335,9 @@ All env vars are optional. The witness runs with reasonable defaults.
 | `HCP_PUBLIC_PORT` | falls back to `HCP_PORT` | Public port this witness announces. Set if external port and internal port differ. |
 | `HCP_URL` | (unset) | Legacy public URL announcement field. Used by older clients. Optional. |
 | `HCP_SEEDS` | (empty) | Comma-separated list of seed peer URLs to attempt at startup. Used by witnesses that want to join an existing peer network. |
+| `HCP_PEER_MAX` | `256` | Most peers this witness keeps. New peers are refused once it is full; known peers always refresh. |
+| `HCP_PEER_PER_OWNER` | `3` | Most peers kept from one owner (registrable domain name, or one IP). |
+| `HCP_PEER_PER_FREE` | `16` | Most peers kept from one free name service (DuckDNS and similar), which counts as a single owner. |
 | `HCP_PROBE_DISABLED` | (unset) | When set to `1`, skips the inbound-reachability self-check on startup. Useful when running behind a reverse proxy where the self-check cannot reach the public endpoint. |
 | `HCP_HEARTBEAT_INTERVAL_MS` | `900000` (15 min) | Override the heartbeat interval. Mainly for tests. |
 | `HCP_DEBUG` | (unset) | When set to `1`, registers a `POST /debug/heartbeat` endpoint for testing. Off in production. |
