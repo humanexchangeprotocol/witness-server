@@ -29,6 +29,54 @@ const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const DB_SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HCP_HEARTBEAT_INTERVAL_MS, 10) || (15 * 60 * 1000); // default 15 minutes; env override in seconds*1000 for test/operator tuning
 const PEER_STALE_HOURS = 24;
+// v2.14.0 (Oct 15, 2026): peer flood limits. A witness admits a NEW peer only while it
+// holds fewer than PEER_MAX peers and fewer than PEER_PER_OWNER from the same owner
+// (registrable domain; a free name service such as DuckDNS is one owner with PEER_PER_FREE;
+// a bare IP is its own owner). Known peers always refresh; seed hosts are always admitted.
+// Fixed numbers, so the count of instances an attacker runs stops mattering. Matches the
+// phone's carrier limits (app 2.143.0). Configurable by env for test rigs and operators.
+const PEER_MAX = parseInt(process.env.HCP_PEER_MAX, 10) || 256;
+const PEER_PER_OWNER = parseInt(process.env.HCP_PEER_PER_OWNER, 10) || 3;
+const PEER_PER_FREE = parseInt(process.env.HCP_PEER_PER_FREE, 10) || 16;
+const PEER_FREE_NAMES = ['duckdns.org', 'ddns.net', 'no-ip.org', 'no-ip.com', 'noip.me', 'hopto.org', 'zapto.org', 'sytes.net', 'servebeer.com', 'afraid.org', 'mooo.com', 'dynu.net', 'dynv6.net', 'freeddns.org', 'nip.io', 'sslip.io', 'ngrok.io', 'ngrok-free.app', 'ngrok.app', 'trycloudflare.com', 'loca.lt', 'serveo.net', 'github.io', 'netlify.app', 'vercel.app', 'pages.dev', 'workers.dev', 'herokuapp.com', 'onrender.com', 'fly.dev', 'glitch.me', 'repl.co', 'replit.dev', 'deno.dev', 'tailscale.net', 'ts.net'];
+const PEER_TWO_LEVEL = ['co.uk', 'org.uk', 'ac.uk', 'me.uk', 'com.au', 'net.au', 'org.au', 'co.in', 'net.in', 'org.in', 'firm.in', 'co.jp', 'ne.jp', 'or.jp', 'com.br', 'co.nz', 'co.za', 'com.mx', 'com.ar', 'com.cn', 'com.tw', 'co.kr', 'com.sg', 'com.tr', 'com.hk', 'co.id', 'com.my', 'com.ph', 'com.ng', 'co.ke', 'com.pk', 'com.bd', 'com.np', 'com.co', 'com.pe', 'com.ve', 'com.ua', 'com.eg', 'co.il', 'co.th', 'com.vn'];
+function peerHostOf(hostOrUrl) {
+  if (typeof hostOrUrl !== 'string' || !hostOrUrl) return '';
+  if (hostOrUrl.indexOf('://') < 0) return hostOrUrl.trim().toLowerCase().replace(/:\d+$/, '');
+  try { return new URL(hostOrUrl).hostname.toLowerCase(); } catch { return ''; }
+}
+function peerOwner(hostOrUrl) {
+  const h = peerHostOf(hostOrUrl);
+  if (!h) return { owner: '', cap: PEER_PER_OWNER };
+  if (/^[0-9.]+$/.test(h) || h.indexOf(':') >= 0) return { owner: h, cap: PEER_PER_OWNER };
+  for (const f of PEER_FREE_NAMES) if (h === f || h.endsWith('.' + f)) return { owner: 'free:' + f, cap: PEER_PER_FREE };
+  const lab = h.split('.'), two = lab.slice(-2).join('.');
+  return { owner: (lab.length >= 3 && PEER_TWO_LEVEL.includes(two)) ? lab.slice(-3).join('.') : two, cap: PEER_PER_OWNER };
+}
+let _seedHosts = null;
+function peerIsSeedHost(h) {
+  if (!_seedHosts) _seedHosts = (process.env.HCP_SEEDS || '').split(',').map(x => peerHostOf(x.trim())).filter(Boolean);
+  return _seedHosts.includes(h);
+}
+// peerAdmit: true if a peer with this pubkey (or legacy url) at this host/url may be added.
+function peerAdmit(pubkey, hostOrUrl, legacyUrl) {
+  try {
+    const known = legacyUrl
+      ? db.exec('SELECT 1 FROM peers WHERE url = ?', [legacyUrl])
+      : db.exec('SELECT 1 FROM peers WHERE pubkey = ?', [pubkey]);
+    if (known.length && known[0].values.length) return true;
+    const h = peerHostOf(hostOrUrl);
+    if (h && peerIsSeedHost(h)) return true;
+    const self = SELF_URL ? SELF_URL.replace(/\/+$/, '') : '';
+    const rows = db.exec('SELECT url, host FROM peers');
+    const all = rows.length ? rows[0].values.filter(r => r[0] !== self) : [];
+    if (all.length >= PEER_MAX) { console.log(`[peers] refused ${h || hostOrUrl}: table full (${PEER_MAX})`); return false; }
+    const o = peerOwner(hostOrUrl);
+    const same = all.filter(r => peerOwner(r[1] || r[0]).owner === o.owner).length;
+    if (same >= o.cap) { console.log(`[peers] refused ${h}: owner ${o.owner} at its limit (${o.cap})`); return false; }
+    return true;
+  } catch (e) { console.error('[peers] admit check failed:', e.message); return false; }
+}
 const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legacy)
 // Phase A signed-mode self-identification (witness-identity-protocol §6.1).
 // If unset, the witness still accepts signed announces but cannot originate
@@ -36,7 +84,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.13.2';
+const VERSION = '2.14.0';
 
 let db = null;
 let serverKeys = null;
@@ -943,6 +991,9 @@ function handleLegacyAnnounce(req, res) {
   const existing = db.exec('SELECT pubkey FROM peers WHERE url = ?', [cleanUrl]);
   const isNew = existing.length === 0 || existing[0].values.length === 0;
 
+  if (isNew && !peerAdmit(pubkey, cleanUrl, cleanUrl)) {
+    return res.status(429).json({ error: 'peer limit reached' });
+  }
   // Upsert the peer
   db.run('DELETE FROM peers WHERE url = ?', [cleanUrl]);
   db.run(
@@ -957,7 +1008,7 @@ function handleLegacyAnnounce(req, res) {
       const pUrl = p.url.replace(/\/+$/, '');
       if (SELF_URL && pUrl === SELF_URL.replace(/\/+$/, '')) continue;
       const pExists = db.exec('SELECT url FROM peers WHERE url = ?', [pUrl]);
-      if (pExists.length === 0 || pExists[0].values.length === 0) {
+      if ((pExists.length === 0 || pExists[0].values.length === 0) && peerAdmit(p.pubkey, pUrl, pUrl)) {
         // New peer we didn't know about. Add with their reported heartbeat or now
         db.run(
           'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -1047,6 +1098,9 @@ function handleSignedAnnounce(req, res) {
   // binding). reachable starts at 0 and is updated to 1 by the async
   // probe (triggerReachabilityProbe below) if /status confirms the
   // pubkey-to-endpoint binding.
+  if (!peerAdmit(body.pubkey, body.endpoint.host)) {
+    return res.status(429).json({ error: 'peer limit reached' });
+  }
   const synthesized = `signed://${body.pubkey}@${body.endpoint.host}:${body.endpoint.port}`;
   db.run('DELETE FROM peers WHERE pubkey = ?', [body.pubkey]);
   db.run(
@@ -1085,7 +1139,7 @@ function handleSignedAnnounce(req, res) {
       if (typeof pHost !== 'string' || pHost.length === 0) continue;
       if (!Number.isInteger(pPort) || pPort < 1 || pPort > 65535) continue;
       const known = db.exec('SELECT pubkey FROM peers WHERE pubkey = ?', [p.pubkey]);
-      if (known.length === 0 || known[0].values.length === 0) {
+      if ((known.length === 0 || known[0].values.length === 0) && peerAdmit(p.pubkey, pHost)) {
         const pUrl = `signed://${p.pubkey}@${pHost}:${pPort}`;
         db.run(
           'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -1323,7 +1377,7 @@ async function announceToServer(targetUrl) {
           const pUrl = p.url.replace(/\/+$/, '');
           if (SELF_URL && pUrl === SELF_URL.replace(/\/+$/, '')) continue;
           const exists = db.exec('SELECT url FROM peers WHERE url = ?', [pUrl]);
-          if (exists.length === 0 || exists[0].values.length === 0) {
+          if ((exists.length === 0 || exists[0].values.length === 0) && peerAdmit(p.pubkey, pUrl, pUrl)) {
             db.run(
               'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at) VALUES (?, ?, ?, ?, ?, ?)',
               [pUrl, p.pubkey, p.version || '?', p.witnessed_count || 0, p.last_seen || now, now]
@@ -1421,7 +1475,7 @@ async function announceSignedToServer(targetUrl, targetPubkey) {
         if (typeof pHost !== 'string' || pHost.length === 0) continue;
         if (!Number.isInteger(pPort) || pPort < 1 || pPort > 65535) continue;
         const known = db.exec('SELECT pubkey FROM peers WHERE pubkey = ?', [p.pubkey]);
-        if (known.length === 0 || known[0].values.length === 0) {
+        if ((known.length === 0 || known[0].values.length === 0) && peerAdmit(p.pubkey, pHost)) {
           const pUrl = `signed://${p.pubkey}@${pHost}:${pPort}`;
           db.run(
             'INSERT INTO peers (url, pubkey, version, witnessed_count, last_heartbeat, added_at, host, port) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
