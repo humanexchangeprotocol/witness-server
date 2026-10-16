@@ -84,7 +84,7 @@ const SELF_URL = process.env.HCP_URL || null; // This server's public URL (legac
 const SELF_HOST = process.env.HCP_PUBLIC_IP || null;
 const SELF_PORT_PUBLIC = parseInt(process.env.HCP_PUBLIC_PORT, 10) || (parseInt(process.env.HCP_PORT, 10) || 3141);
 const SEED_PEERS = (process.env.HCP_SEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const VERSION = '2.14.0';
+const VERSION = '2.15.0';
 
 let db = null;
 let serverKeys = null;
@@ -1649,6 +1649,40 @@ function validSessionCode(code) {
   return /^[A-Z]{4}$/.test(code);
 }
 
+// --- Close boxes (v2.15.0, Oct 16 2026, the hop close rendezvous) ---
+// When a receipt hop stalls on the witness that relayed an exchange, the two phones
+// move to a backup witness they agreed inside their sealed content and finish there.
+// A box is one slot, in memory only, addressed by a code both phones derive from
+// secrets only they hold: the posting phone leaves one sealed blob, the other phone
+// reads it. The witness learns nothing but the code, the blob and a time. Nothing is
+// kept past BOX_TTL_S and nothing is written to the database (Michael, Oct 16: the
+// witness holds nothing for finish-later). Allowlist: box code, sealed blob, time.
+const BOX_TTL_S = 15 * 60;
+const BOX_MAX = 20000;
+const BOX_BLOB_MAX = 16384;
+const closeBoxes = new Map(); // code -> { sealed, at }
+function validBoxCode(c) { return typeof c === 'string' && /^[0-9a-f]{32}$/.test(c); }
+function sweepBoxes() {
+  const cut = Math.floor(Date.now() / 1000) - BOX_TTL_S;
+  for (const [k, v] of closeBoxes) if (v.at < cut) closeBoxes.delete(k);
+}
+app.post('/box/:code', allow(['sealed']), (req, res) => {
+  const { code } = req.params; const { sealed } = req.body;
+  if (!validBoxCode(code)) return res.status(400).json({ error: 'Invalid box code' });
+  if (!sealed || typeof sealed !== 'string' || sealed.length > BOX_BLOB_MAX) return res.status(400).json({ error: 'Missing or oversized sealed blob' });
+  sweepBoxes();
+  if (!closeBoxes.has(code) && closeBoxes.size >= BOX_MAX) return res.status(503).json({ error: 'Box table full' });
+  closeBoxes.set(code, { sealed, at: Math.floor(Date.now() / 1000) });
+  res.json({ stored: true });
+});
+app.get('/box/:code', (req, res) => {
+  const { code } = req.params;
+  if (!validBoxCode(code)) return res.status(400).json({ error: 'Invalid box code' });
+  const b = closeBoxes.get(code);
+  if (!b || b.at < Math.floor(Date.now() / 1000) - BOX_TTL_S) return res.json({ found: false });
+  res.json({ found: true, sealed: b.sealed });
+});
+
 // --- Session presence and cancel (v2.7.0, Oct 2 rulings) ---
 // Presence is in memory only: the time each code last talked to us.
 // Every session call counts (join, poll, thread, propose, confirm,
@@ -2405,6 +2439,8 @@ async function start() {
     console.log(`         POST /session/join     join a session`);
     console.log(`         GET  /session/:code    poll session state`);
     console.log(`         POST /session/:code/thread  push thread snapshot`);
+    console.log(`         POST /box/:code             leave a sealed close hop (in memory, 15 min)`);
+    console.log(`         GET  /box/:code             read it`);
     console.log(`         POST /session/:code/propose submit proposal`);
     console.log(`         POST /session/:code/confirm confirm proposal`);
     console.log(`         POST /session/:code/cancel  end the exchange for both`);
